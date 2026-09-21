@@ -1,0 +1,16 @@
+<!--
+  open-in-new, from Material Design Icons (https://pictogrammers.com/library/mdi/icon/open-in-new/).
+  Material Design Icons is licensed under the Apache License 2.0; see data/ICONS-LICENSE.md.
+
+  The path data is MDI's, unmodified. The 24x24 viewBox and the transparent
+  iconBase rect follow the convention Kit's own icon SVGs use, so this scales
+  the way the ones shipped with the SDK do.
+
+  Filled white on purpose. omni.ui tints a button's image through the
+  "Button.Image" style, so the colour is chosen in panel.py beside the rest of
+  the theme rather than baked in here.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <rect id="iconBase" width="24" height="24" fill="none"/>
+  <path id="open-in-new" fill="#ffffff" d="M14,3V5H17.59L7.76,14.83L9.17,16.24L19,6.41V10H21V3M19,19H5V5H12V3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V12H19V19Z"/>
+</svg>

@@ -1,0 +1,7 @@
+# Reviewers for every pull request in this repository.
+#
+# A user rather than a team, deliberately: an entry naming a team that does not
+# exist is silently ignored, and the first anyone notices is a pull request that
+# cannot be approved. Use @runnitai/<team> once a team exists and its slug has
+# been confirmed.
+* @cravennathan

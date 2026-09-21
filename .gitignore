@@ -1,0 +1,11 @@
+# Python bytecode and test caches. The extension ships as source, so nothing
+# generated belongs in a release.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editors and OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

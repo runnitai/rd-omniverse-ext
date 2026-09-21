@@ -1,0 +1,51 @@
+[package]
+# `name` must equal the folder this extension lives in. Kit resolves the
+# extension id from the folder, the registry reads it from here, and saved user
+# preferences are keyed on it, so a rename orphans every existing install's
+# settings. It does not change when the repository is renamed.
+name = "rundiffusion.omniverse"
+title = "RunDiffusion"
+version = "0.3.0"
+# Kit lists this beside the title in the Extensions window, so it is one line
+# rather than the full opening of the listing copy. The rest of that copy is in
+# docs/README.md, which the same window renders on the extension's page.
+description = "Generate AI images from your viewport and add generated 3D assets directly to your stage."
+authors = ["RunDiffusion"]
+# The public mirror, not the repository this is built from. Kit shows this in
+# the Extensions window and every release carries it, so it has to be somewhere
+# a user can actually go.
+repository = "https://github.com/runnitai/rd-omniverse-ext"
+license = "MPL-2.0"
+category = "Rendering"
+keywords = ["rundiffusion", "ai", "image", "generate", "viewport"]
+changelog = "docs/CHANGELOG.md"
+readme = "docs/README.md"
+icon = "data/rd-mark.png"
+
+# Every dependency here was verified present in BOTH target hosts before being
+# added: the boilerplate Kit SDK 110.1.2 (production, windows-x86_64) and a
+# packaged Composer app on 110.1.2. Adding one is a bet that a customer's app
+# ships it, so the bet is checked rather than assumed. Versions seen in the
+# packaged app's extscache: omni.ui 3.2.0, omni.kit.viewport.utility 2.0.1,
+# omni.usd 1.16.0, omni.kit.uiapp 0.0.0, all on build f9bf0dda / cp312.
+#
+# Deliberately NOT depended on: anything from the Base Editor's or Composer's
+# own furniture (content browser, stage widgets, property window). Those are
+# the extensions a stripped packaged viewer is most likely to omit.
+[dependencies]
+"omni.kit.uiapp" = {}                 # pulls omni.ui
+"omni.kit.viewport.utility" = {}      # active viewport + in-memory capture
+"omni.usd" = {}
+# Carries the prebundled cp312 wheels, Pillow 12.2.0 and numpy among them, so
+# the PNG encode needs no vendored wheel of our own. Present in both hosts as
+# omni.kit.pip_archive-0.0.0+f9bf0dda.wx64.cp312.
+"omni.kit.pip_archive" = {}
+
+[[python.module]]
+name = "rundiffusion_omniverse"
+
+[[test]]
+dependencies = [
+    "omni.kit.test",
+]
+args = []

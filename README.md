@@ -21,15 +21,27 @@ is currently in beta.
 ## Install
 
 **From your app's Extensions window.** Open **Window > Extensions** and search
-for **RunDiffusion**. If community extensions are not listed, turn on
-third-party extensions in that window's settings first. Install it, then switch
-on **Autoload** in the same row so it comes back next time the app starts.
+for **RunDiffusion**. Install it, then switch on **Autoload** in the same row so
+it comes back next time the app starts.
+
+If the search finds nothing, check the window's **Extension Registries** list
+first. A Kit application does not necessarily come with the community registry
+configured, and with none configured there is nothing to search. Add it as:
+
+| Name | URL |
+| --- | --- |
+| `kit/community` | `https://dw290v42wisod.cloudfront.net/exts/kit/community` |
 
 **From a release.** Download the zip from
 [Releases](https://github.com/runnitai/rd-omniverse-ext/releases), unzip it, and
 rename the folder inside to `rundiffusion.omniverse` if it carries a version
 suffix. Move that folder into your app's `exts` folder, beside the extensions
-already there, and start the app.
+already there, and start the app. Nothing to run and nothing to configure: a Kit
+extension is a folder.
+
+To update a copy installed this way, delete the old folder, drop the new one in
+its place and restart. Your sign-in survives the swap. The version you are
+running is on the **Account** tab, which is the number to quote in a bug report.
 
 If you already installed a copy by hand, delete that folder before installing
 from the registry. Two copies of the same extension is one copy too many.
@@ -39,6 +51,13 @@ from the registry. Two copies of the same extension is one copy too many.
 The panel opens on a sign-in screen. Press **Sign in**, authorize the device in
 the browser window that opens, and come back. The panel remembers the session,
 sealed to your Windows user account, so you only do this once per machine.
+
+A RunDiffusion account is all you need. If the panel tells you this plugin is
+not enabled for your account, you are on a plan where an administrator chooses
+which plugins are available: ask them to enable this one.
+
+Every generation is billed to the account named under BILLED TO in the footer.
+Check it before your first run if you can act on more than one account.
 
 ## Support
 

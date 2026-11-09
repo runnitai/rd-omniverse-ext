@@ -1169,6 +1169,8 @@ class AssetPicker:
                     ),
                 )
                 self._more_button.enabled = False
+                # Shown once a page says there is more. See `_show_more`.
+                self._more_button.visible = False
 
         self._window.visible = True
         # Opened straight onto the library rather than onto a chooser. Asking
@@ -1243,6 +1245,7 @@ class AssetPicker:
 
         self._cursor = page.next_cursor
         self._has_more = bool(page.has_more and page.next_cursor)
+        self._show_more(self._has_more)
         # Images only. This window exists to fill an image FIELD, which takes an
         # IMG reference, so a library video here is a cell whose only outcome is
         # a rejected run. Filtered client-side because `/library` has no result
@@ -1276,6 +1279,21 @@ class AssetPicker:
             return ""
         more = " so far" if self._has_more else ""
         return f"Showing {self._shown} image{'' if self._shown == 1 else 's'}{more}."
+
+    def _show_more(self, shown: bool) -> None:
+        """Load more is there only while the server says there is more.
+
+        Decided when a page lands rather than when one is asked for, so the
+        button does not vanish and come back under the pointer of someone
+        paging. A disabled button looks like an enabled one in this toolkit,
+        and one under "No images here yet." read as a promise of more.
+        """
+        if self._more_button is None:
+            return
+        try:
+            self._more_button.visible = shown
+        except Exception:  # noqa: BLE001 - a destroyed button is not a failure
+            logger.debug("RunDiffusion: the picker's Load more button is gone.")
 
     def _set_more_enabled(self, enabled: bool) -> None:
         if self._more_button is None:

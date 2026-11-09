@@ -226,6 +226,20 @@ class TestTheRowIsOnlyAboutWhatIsSent:
         assert "3 of 12" in texts
         assert "IMAGE · OPTIONAL" in texts
 
+    def test_a_label_that_already_says_optional_says_it_once(self):
+        """Seen on a real tool: "IMAGE(S) TO EDIT (OPTIONAL) · OPTIONAL"."""
+        form = ToolForm()
+        form.image_field_keys = ["image"]
+        form.image_field_labels = {"image": "Image(s) to edit (optional)"}
+        form._plural_keys = {"image"}
+        container = ui.Frame()
+        form._image_containers["image"] = container
+
+        form._render_image_field_now("image")
+
+        texts = [node.args[0] for node in _of_kind(container, "Label") if node.args]
+        assert "IMAGE(S) TO EDIT · OPTIONAL" in texts
+
     def test_the_row_holding_the_images_can_grow(self):
         """It used to be pinned to one thumbnail tall, which is the same thing
         as saying the images may not wrap."""

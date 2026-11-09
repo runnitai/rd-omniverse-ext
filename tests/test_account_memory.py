@@ -20,6 +20,13 @@ import pytest
 from rundiffusion_omniverse.api import token_store
 from rundiffusion_omniverse.api.session import Account, RdSession
 
+class ImmediateRedraws:
+    """Runs a deferred redraw at once, so a test can see what it did."""
+
+    def request(self, _key, render) -> None:
+        render()
+
+
 PERSONAL = Account(id="p1", label="Personal", kind="PERSONAL")
 TEAM = Account(id="t1", label="Acme", kind="TEAM")
 OTHER_TEAM = Account(id="t2", label="Globex", kind="TEAM")
@@ -302,6 +309,13 @@ class TestThePickerActuallyChooses:
         panel._set_cost = lambda _message: None
         panel._show_tab = lambda _index: None
         panel._check_plugin_access = lambda: False  # stops before the refetches
+        panel._account_carry = None
+        panel._cost_task = None
+        panel._team_answers = {}
+        panel._account_redraws = ImmediateRedraws()
+        panel._catalog_generation = 0
+        panel._tool_load_generation = 0
+        panel._tool_detail_pending = False
         return panel
 
     def test_choosing_a_team_selects_it_on_the_session(self, store):
@@ -378,6 +392,13 @@ class TestSwitchingAccountWithASurfaceTornOut:
         panel._set_cost = lambda _message: None
         panel._show_tab = lambda _index: None
         panel._check_plugin_access = lambda: False
+        panel._account_carry = None
+        panel._cost_task = None
+        panel._team_answers = {}
+        panel._account_redraws = ImmediateRedraws()
+        panel._catalog_generation = 0
+        panel._tool_load_generation = 0
+        panel._tool_detail_pending = False
         return panel
 
     def test_a_docked_surface_on_screen_is_rebuilt_too(self, store):

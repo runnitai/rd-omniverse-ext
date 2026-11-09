@@ -5,7 +5,7 @@
 # settings. It does not change when the repository is renamed.
 name = "rundiffusion.omniverse"
 title = "RunDiffusion"
-version = "0.3.0"
+version = "0.4.0"
 # Kit lists this beside the title in the Extensions window, so it is one line
 # rather than the full opening of the listing copy. The rest of that copy is in
 # docs/README.md, which the same window renders on the extension's page.

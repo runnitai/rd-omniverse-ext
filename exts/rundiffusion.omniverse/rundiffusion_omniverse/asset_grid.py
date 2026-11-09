@@ -22,6 +22,8 @@ import time
 import urllib.error
 import io
 import logging
+import os
+import uuid
 from pathlib import Path
 
 import omni.ui as ui
@@ -82,8 +84,12 @@ def _retry_after_seconds(error: Exception) -> float | None:
 
 
 
-def _write_as_png(data: bytes, path: Path) -> bool:
-    """Decode whatever came back and write a real PNG. True on success.
+def _write_as_png(data: bytes, path: Path) -> bool | None:
+    """Decode whatever came back and write a real PNG.
+
+    True when the picture is stored. False when the bytes are not an image,
+    which is a settled answer. None when a good picture could not be put in
+    place (something else held the file), which is worth asking again.
 
     The bytes are NOT necessarily a PNG. Library and upload thumbnails are
     512x512 **WebP**, and Kit's texture loader cannot read WebP: writing those
@@ -95,18 +101,47 @@ def _write_as_png(data: bytes, path: Path) -> bool:
     loader is the limitation rather than the extension. So the bytes are decoded
     and re-encoded through the prebundled Pillow, which turns any format the
     server sends into one the host can definitely display.
+
+    Written beside the target and moved into place, never written in place. The
+    grids share one cache folder, so two of them can fetch the same avatar at
+    once, and the texture loader reads a file on its own thread after the image
+    widget names it. Saving in place let the second fetch truncate a file the
+    loader was still reading, which logged "file is empty" and left the tile
+    blank while the avatar itself was fine. A rename is all or nothing: a reader
+    sees the old file or the new one, never half of either.
     """
     from PIL import Image
 
+    partial = path.with_name(f"{path.stem}.{uuid.uuid4().hex[:8]}.part")
     try:
         with Image.open(io.BytesIO(data)) as image:
             # Flattened to RGB(A) because a palette or CMYK image saves to a PNG
             # the loader handles less predictably.
-            image.convert("RGBA").save(path, format="PNG")
-        return True
+            image.convert("RGBA").save(partial, format="PNG")
     except Exception:  # noqa: BLE001 - a bad image costs one cell
         logger.debug("RunDiffusion: could not decode an image for %s.", path.name)
+        _discard(partial)
         return False
+
+    try:
+        os.replace(partial, path)
+    except OSError:
+        # Windows refuses to replace a file another handle has open, and the
+        # texture loader may be reading the copy a racing fetch already put
+        # there. The name is derived from the URL or the asset id, so that copy
+        # is this same picture: keep it rather than lose the cell.
+        _discard(partial)
+        if not path.exists():
+            logger.debug("RunDiffusion: could not store an image for %s.", path.name)
+            return None
+    return True
+
+
+def _discard(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("RunDiffusion: could not remove %s.", path.name)
 
 #: Cells per row at the panel's usual docked width.
 _COLUMNS = 3
@@ -461,7 +496,17 @@ class AssetGrid:
             )
             return None, retryable, _retry_after_seconds(error)
 
-        return (cached, False, None) if _write_as_png(data, cached) else (None, False, None)
+        # Another grid fetching the same image may have finished first. Its copy
+        # is this same picture, and one the loader may already be reading, so
+        # it is used as it is rather than written over.
+        if cached.exists():
+            return cached, False, None
+        stored = _write_as_png(data, cached)
+        if stored:
+            return cached, False, None
+        # Not stored but a real picture: retryable, so the cell is asked for
+        # again rather than left blank for good.
+        return None, stored is None, None
 
     async def _fill_image(
         self, frame: ui.Frame, url: str, size: int, on_done=None

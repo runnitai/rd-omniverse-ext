@@ -44,3 +44,22 @@ def test_anything_but_the_exact_token_is_a_plain_sign_in(intent):
     """Defaulting to the sign-up form for an unrecognised value would send
     existing users somewhere they cannot use."""
     assert verification_url_for_intent(URL, intent) == URL
+
+
+class TestTheAddressAPersonTypes:
+    """The sign-in link carries the code as a query string. The fallback line
+    names the page without it: it is short enough to type on a phone, and the
+    page asks for the code when it has none."""
+
+    def test_the_query_is_dropped(self):
+        from rundiffusion_omniverse.panel import _typeable_address
+
+        assert (
+            _typeable_address("https://app.rundiffusion.com/auth?code=AB12-CD34&plugin=omniverse")
+            == "app.rundiffusion.com/auth"
+        )
+
+    def test_something_that_is_not_a_url_is_shown_as_it_came(self):
+        from rundiffusion_omniverse.panel import _typeable_address
+
+        assert _typeable_address("not a url") == "not a url"

@@ -24,7 +24,7 @@ from .transport import (
     request_json_async,
     with_query,
 )
-from .session import RdSession
+from .session import Account, RdSession
 from .tools import ImageSelection, ToolDetail, build_inputs, ordered_captures
 
 logger = logging.getLogger(__name__)
@@ -166,11 +166,16 @@ async def preview_cost(
     values: dict,
     num_results: int = 1,
     image_selections: dict[str, list[ImageSelection]] | None = None,
+    account: Account | None = None,
 ) -> dict:
     """The authoritative token cost, before the user spends anything.
 
     Branch on `can_run`, never on `blocking_reason`: the reason is a display
     string with no stable vocabulary.
+
+    `account` prices the run on an account other than the selected one. Nothing
+    is spent and nothing is selected: it only answers whether that account
+    could run this.
     """
     body = {
         "tool_id": tool.id,
@@ -182,7 +187,7 @@ async def preview_cost(
     }
     return await request_json_async(
         "POST",
-        with_query(f"{api_base_url()}/generate/preview-cost", session.account_params()),
+        with_query(f"{api_base_url()}/generate/preview-cost", session.account_params(account)),
         body=body,
         headers=await session.auth_headers(),
     )
@@ -212,8 +217,13 @@ async def submit(
     values: dict,
     num_results: int = 1,
     image_selections: dict[str, list[ImageSelection]] | None = None,
+    account: Account | None = None,
 ) -> str:
     """POST the run. Returns the request id from the 202.
+
+    `account` is who pays, read when Generate was pressed. Without it the
+    account was read after the token refresh awaited below, so a switch made
+    in that moment billed the run to the account switched to.
 
     `image_selections` is what the user put in each image field, in order, and
     each capture carries its own bytes. Nothing is captured here: the images were
@@ -254,7 +264,7 @@ async def submit(
     )
 
     payload = await post_multipart_async(
-        with_query(f"{api_base_url()}/generate", session.account_params()),
+        with_query(f"{api_base_url()}/generate", session.account_params(account)),
         fields={"payload": json.dumps(body)},
         files=capture_file_parts(captures),
         headers=headers,
@@ -266,12 +276,19 @@ async def poll_until_done(
     session: RdSession,
     request_id: str,
     on_status: Callable[[str], None] | None = None,
+    account: Account | None = None,
 ) -> GenerateResult:
     """Poll until the run reaches a terminal state.
 
     The server tells us how long to wait between polls via `retry_after_seconds`,
     so honour it rather than picking an interval: it is what keeps a slow queue
     from being hammered by every connected plugin at once.
+
+    `account` is the one the run was submitted under. The server answers a
+    run's status only to the account that started it, and reading the selected
+    account on every poll meant that choosing another one mid-run turned the
+    next poll into "not found": the job showed as failed while the run was
+    still going, and its results never arrived.
     """
     deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT_SECONDS
     delay = 2
@@ -279,7 +296,7 @@ async def poll_until_done(
     while True:
         payload: dict[str, Any] = await request_json_async(
             "GET",
-            with_query(f"{api_base_url()}/generate/{request_id}", session.account_params()),
+            with_query(f"{api_base_url()}/generate/{request_id}", session.account_params(account)),
             headers=await session.auth_headers(),
         )
         status = str(payload.get("status") or "")

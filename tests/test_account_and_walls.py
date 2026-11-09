@@ -12,6 +12,7 @@ from rundiffusion_omniverse.api.session import Account, RdSession
 from rundiffusion_omniverse.api.token_wall import (
     SUBSCRIPTIONS_URL,
     VARIANT_GET_TOKENS,
+    VARIANT_TEAM_BLOCKED,
     VARIANT_TEAM_DEPLETED,
     VARIANT_VERIFY,
     VERIFY_EMAIL_URL,
@@ -116,8 +117,20 @@ class TestBalanceWall:
         )
 
         assert wall is not None
-        assert wall.variant == VARIANT_TEAM_DEPLETED
+        assert wall.variant == VARIANT_TEAM_BLOCKED
         assert wall.action_label is None
+        assert wall.action_url is None
+
+    def test_a_402_for_a_team_names_it_and_its_administrators(self):
+        wall = wall_for_error(
+            "INSUFFICIENT_BALANCE", 402, is_personal=False, email_verified=True,
+            account_name="Acme",
+        )
+
+        assert wall is not None
+        assert wall.variant == VARIANT_TEAM_DEPLETED
+        assert wall.message.startswith("Acme ")
+        assert "administrators" in wall.detail
         assert wall.action_url is None
 
     def test_the_servers_wording_is_shown_but_never_parsed(self):

@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.4.0] - 2026-11-04
+
+### Added
+
+- **Choose how big a 3D asset lands.** Add to stage asks for the length of the
+  asset's longest side and a unit (m, cm, mm, ft or in), prefilled with your
+  last answer. A scale correction already on the asset is kept, and adding,
+  placing and sizing it is one undo step.
+- **Switch to the account that can pay.** When your personal account cannot
+  run a tool (a free plan, or too few tokens) and another account you belong
+  to can, the panel says so and offers **Switch to** that account instead of
+  an upgrade prompt. The switch keeps the tool, the prompt and your captures.
+  Images picked from your personal library or uploads stay behind, and the
+  panel says so.
+
+### Changed
+
+- **A shared account that cannot run a tool is named**, with the server's
+  reason and who manages its plan, token budget and permissions. It is never
+  offered a purchase, since a personal checkout cannot top it up.
+- **A free plan on generate gets its own message** (a paid plan is required to
+  generate from plugins) rather than a generic failure, and a deactivated
+  account says so.
+- The Account tab offers **Get tokens** only while your personal account is
+  billed. A shared account's plan is its administrators' to change.
+- A token wall about a run shows on the Create tab only, and no longer blinks
+  while the run is re-priced.
+- Sign-in's second step is an **Open the sign-in page** button, with a short
+  address to type on another device. The full link ran off a docked panel.
+- **Load more** is hidden once a list has nothing more to load, and an empty
+  Library or Uploads tab no longer asks you to click an image.
+
+### Fixed
+
+- **Changing BILLED TO while a run is in progress no longer loses it.** The
+  panel kept asking about the run as the newly chosen account, which the server
+  does not answer, so the run showed as failed while it was still running
+  and its results never arrived. It is now followed on the account it was
+  started with.
+- Changing BILLED TO from another tab no longer leaves the Create tab naming a
+  tool with none of its inputs, and Generate saying no tool was selected.
+- A tool or an account chosen while the previous one was still loading could
+  be overwritten by the slower answer. Only the newest choice is drawn.
+- Tool avatars could show blank, with "file is empty" in the console, when two
+  windows fetched the same avatar at once. Cached images are now written to a
+  temporary file and moved into place, so the texture loader never reads a
+  half-written one.
+- An image field whose label already said "(optional)" read OPTIONAL twice.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

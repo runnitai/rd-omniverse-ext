@@ -48,6 +48,15 @@ RECENT_TOOLS = "/persistent/exts/rundiffusion.omniverse/recentTools"
 #: How many recent tools are remembered, and shown.
 RECENT_TOOLS_LIMIT = 2
 
+#: The longest side and unit last asked for when adding a 3D asset to the stage.
+#:
+#: Remembered because a person placing furniture into a room places a run of
+#: things at similar sizes in the same unit, and retyping "cm" every time is the
+#: kind of friction that gets a size prompt skipped with Enter. Kept as two
+#: settings rather than one string, so each is readable in Kit's settings view.
+INSERT_LENGTH = "/persistent/exts/rundiffusion.omniverse/insertLength"
+INSERT_UNIT = "/persistent/exts/rundiffusion.omniverse/insertUnit"
+
 
 def torn_out_key(surface: str) -> str:
     """The preference naming whether `surface` belongs in a window of its own.
@@ -91,6 +100,29 @@ def get_string(key: str, default: str = "") -> str:
         return str(_FALLBACK.get(key, default))
     value = store.get(key)
     return default if value is None else str(value)
+
+
+def get_float(key: str, default: float = 0.0) -> float:
+    store = _settings()
+    value = _FALLBACK.get(key) if store is None else store.get(key)
+    try:
+        return default if value is None else float(value)
+    except (TypeError, ValueError):
+        # A hand-edited config can hold anything. A preference that cannot be
+        # read is the same as one never written.
+        return default
+
+
+def set_float(key: str, value: float) -> None:
+    store = _settings()
+    if store is None:
+        _FALLBACK[key] = float(value)
+        return
+    try:
+        store.set_float(key, float(value))
+    except Exception:  # noqa: BLE001 - a preference that will not save is not fatal
+        logger.info("RunDiffusion: could not save the %s preference.", key)
+        _FALLBACK[key] = float(value)
 
 
 def set_string(key: str, value: str) -> None:

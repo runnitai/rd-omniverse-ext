@@ -2347,6 +2347,12 @@ class ToolForm:
         """
         label = self.image_field_labels.get(key, "Images").upper()
         if key not in self._required_keys:
+            # Some tools already say so in the label ("Image(s) to edit
+            # (optional)"), and the header then read OPTIONAL twice. The tool's
+            # own word is dropped rather than ours, so every optional field is
+            # marked the same way.
+            if label.endswith("(OPTIONAL)"):
+                label = label[: -len("(OPTIONAL)")].rstrip()
             label = f"{label} · OPTIONAL"
         with ui.HStack(height=20, spacing=6):
             if selected is None:

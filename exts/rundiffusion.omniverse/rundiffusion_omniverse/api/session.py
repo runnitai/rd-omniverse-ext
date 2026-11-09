@@ -77,6 +77,10 @@ class Account:
     #: kind INCLUDING ones added later, which is how an account can work with a
     #: plugin released after it was set up.
     plugin_kinds: list = field(default_factory=list)
+    #: What this account's company calls a team ("Team" unless it renamed the
+    #: concept, to "Studio" say). Copy that names a team without naming it uses
+    #: this rather than the word, which would read wrong to that company.
+    team_label: str | None = None
 
     @property
     def is_personal(self) -> bool:
@@ -146,14 +150,18 @@ class RdSession:
         """Unverified callers hit a different wall with a free fix."""
         return bool(self.user.get("email_verified"))
 
-    def account_params(self) -> dict[str, str]:
-        """Account selection as v2 spells it.
+    def account_params(self, account: Account | None = None) -> dict[str, str]:
+        """Account selection as v2 spells it, for `account` or the selected one.
 
         A query parameter, NOT the X-Account-Id header v1 used, and OMITTED
         rather than sent empty for a personal account: the account follows this
         parameter alone.
+
+        `account` asks about one that is not selected, which is how the panel
+        finds out whether a team could run what the personal account cannot
+        without switching to it first.
         """
-        account = self.selected_account
+        account = account if account is not None else self.selected_account
         if account is not None and not account.is_personal and account.id:
             return {"team_id": account.id}
         return {}
@@ -242,6 +250,7 @@ class RdSession:
                 kind=account.get("kind"),
                 permissions=account.get("permissions") or {},
                 plugin_kinds=account.get("plugin_kinds") or [],
+                team_label=account.get("team_label"),
             )
             for account in payload.get("accounts") or []
         ]

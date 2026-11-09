@@ -26,10 +26,11 @@ import tempfile
 import time
 import uuid
 import webbrowser
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import omni.ui as ui
 
@@ -77,6 +78,7 @@ from .theme import (
 )
 from .compare import CompareWindow, compare_sources, result_source_name
 from .dialogs import AssetPicker, ImageViewer, ToolBrowser
+from .insert_size import InsertSizeDialog
 from .form import (
     CAPTURING_TEXT,
     MAX_INPUT_FILES,
@@ -107,7 +109,7 @@ SURFACE_WINDOW_TITLES = {
 #: Shown on the Account tab and the sign-in screen. Kept in step with
 #: config/extension.toml by the test suite, because a version that lies is worse
 #: than no version at all.
-EXTENSION_VERSION = "0.3.0"
+EXTENSION_VERSION = "0.4.0"
 
 #: Output kinds the panel keeps a local copy of. Everything here can be saved
 #: and sent even where it cannot be drawn, which is the difference between a
@@ -307,6 +309,12 @@ HIDE_TOOLTIP = (
 #: keystroke in a prompt is a change, and preview-cost is a network call.
 COST_DEBOUNCE_SECONDS = 0.6
 
+#: How long the answer to "could one of my teams run this?" is kept for an
+#: unchanged form. Long enough that tab switches and re-pricing the same run
+#: do not ask every team again; short enough that a plan or a budget changed
+#: on the web shows up without a restart.
+TEAM_ANSWER_SECONDS = 30.0
+
 
 def _account_label(account) -> str:
     """What to call an account wherever one is named.
@@ -315,7 +323,84 @@ def _account_label(account) -> str:
     and a team that is "Acme" in one place and a raw id in the other reads as
     two different accounts.
     """
-    return account.label or ("Personal" if account.is_personal else account.id or "Team")
+    if account.label:
+        return account.label
+    if account.is_personal:
+        return "Personal"
+    return account.id or account.team_label or "Team"
+
+
+def _same_account(one, other) -> bool:
+    """Whether two account references name the same account (None is personal)."""
+
+    def key(account):
+        return None if account is None or account.is_personal else account.id
+
+    return key(one) == key(other)
+
+
+def _plugin_gate_subject(account) -> str:
+    """The account the plugin is not enabled for, as a sentence names it."""
+    if account.is_personal:
+        return "your personal account"
+    return wall_api.team_name(account.label, account.team_label)
+
+
+def _plugin_gate_fix(account, *, can_choose_another: bool = False) -> str | None:
+    """Who can turn the plugin on, or what to do instead.
+
+    A team's roles are its administrators' to change, so they are named. A
+    personal account has nobody to ask, so the useful thing to say is that
+    another account may already allow it.
+    """
+    if not account.is_personal:
+        return (
+            "Your account administrators can turn it on for "
+            f"{wall_api.team_name(account.label, account.team_label)}."
+        )
+    if can_choose_another:
+        return "Choose another account under BILLED TO."
+    return None
+
+
+@dataclass
+class _AccountCarry:
+    """What a switch to another account takes with it from the Create tab.
+
+    A switch offered by a wall is a switch in the middle of a task: the person
+    has a tool chosen, a prompt typed and views captured, and the wall is
+    telling them only that the wrong account is paying for it. Starting them
+    over on the first tool of the new account's catalogue would punish them for
+    following the advice.
+
+    Captures come along, because they are pictures of this scene. Images picked
+    from the library or uploads do not: they belong to the account that is being
+    left, and the new one is asked to run with what it can reach.
+    """
+
+    #: The account this carry is for. A carry never applies to any other.
+    account_id: str
+    tool_id: str
+    #: The tool as the catalogue listed it, so it can be adopted on an account
+    #: whose listing does not carry it. It was just priced there, so it runs.
+    tool: Any = None
+    values: dict = field(default_factory=dict)
+    image_state: dict = field(default_factory=dict)
+    capture_sources: dict = field(default_factory=dict)
+    #: How many chosen images stayed behind, so the panel can say so.
+    left_behind: int = 0
+
+
+def _typeable_address(url: str) -> str:
+    """A sign-in link as a person would type it: host and path, nothing else.
+
+    The link carries the code as a query string, and the page it opens asks
+    for the code when it has none, so the short form reaches the same place.
+    """
+    parts = urlsplit(url)
+    if not parts.netloc:
+        return url
+    return f"{parts.netloc}{parts.path}".rstrip("/")
 
 
 def _safe_stem(value: str) -> str:
@@ -478,6 +563,13 @@ class RunDiffusionPanel:
         self._device_prompt: Any = None
         self._sign_in_task: Any = None
         self._wall_frame: ui.Frame | None = None
+        #: Whether a wall is up, and whether it belongs to the Create tab. A
+        #: wall about a run ("cannot run this tool") means nothing over the
+        #: Library or the Account tab, so it is hidden there and shown again on
+        #: the way back. A wall about the account (the plugin is not enabled
+        #: for it) applies to every tab and stays.
+        self._wall_up = False
+        self._wall_create_only = False
         self._status: ui.Label | None = None
         self._content: ui.Frame | None = None
         self._current_tab = TAB_CREATE
@@ -532,6 +624,15 @@ class RunDiffusionPanel:
         #: and that is the Create tab.
         self._account_bar: ui.Frame | None = None
         self._account_combo: ui.ComboBox | None = None
+        #: The Create tab's tool and inputs, on their way to the account a wall
+        #: offered to switch to. Applied once that account's catalogue has the
+        #: tool loaded, then dropped. See `_AccountCarry`.
+        self._account_carry: _AccountCarry | None = None
+        #: Which team could run a run, by what was asked, so returning to the
+        #: Create tab or re-pricing an unchanged form does not ask every team
+        #: again. Short-lived: a team's plan or balance can change while the
+        #: panel sits open. See `_find_team_that_can_run`.
+        self._team_answers: dict = {}
         #: The primary action, in the footer beside BILLED TO rather than at
         #: the bottom of the Create tab's form. See `_render_action_bar`.
         self._action_bar: ui.Frame | None = None
@@ -587,6 +688,7 @@ class RunDiffusionPanel:
             for surface in POPPABLE_SURFACES
         }
         self._compare = CompareWindow()
+        self._insert_size = InsertSizeDialog()
         #: A live thumbnail of the viewport, so a field that says it is sending
         #: the viewport can show which frame it means.
         self._viewport_preview = ViewportPreview(
@@ -633,6 +735,20 @@ class RunDiffusionPanel:
         #: clear during event dispatch, and every renderer here is reachable
         #: from a click. See redraw.py.
         self._redraws = redraw_module.Redraws()
+        #: Account changes wait a frame too (see `_on_account_changed`), but on
+        #: their own queue: a tab switch cancels `_redraws`, and an account
+        #: change it dropped would leave BILLED TO naming one account while the
+        #: panel still showed another's tools.
+        self._account_redraws = redraw_module.Redraws()
+        #: Bumped whenever what a catalogue or a tool load was asked for stops
+        #: being what the panel shows (another account, another tool, signing
+        #: out). A load that comes back to a different number is dropped rather
+        #: than drawn: it answered a question nobody is asking any more.
+        self._catalog_generation = 0
+        self._tool_load_generation = 0
+        #: A tool's inputs are being fetched for the Create tab, so opening the
+        #: tab does not start a second fetch. See `_build_create_tab`.
+        self._tool_detail_pending = False
         self._jobs = JobQueue(on_changed=self._on_jobs_changed)
         self._jobs_frame: ui.Frame | None = None
         #: Surface -> the asset clicked in it, and the frame its actions are
@@ -744,6 +860,7 @@ class RunDiffusionPanel:
         for surface in POPPABLE_SURFACES:
             self._close_window(surface)
         self._compare.destroy()
+        self._insert_size.destroy()
         self._tool_browser.destroy()
         self._asset_picker.destroy()
         self._viewer.destroy()
@@ -1142,14 +1259,20 @@ class RunDiffusionPanel:
                     url = session_api.verification_url_for_intent(
                         prompt.verification_url, self._sign_in_intent
                     )
+                    # The button opens the full link, code and all. The line
+                    # under it gives the short address instead: the link ran
+                    # off the edge of a docked panel, and someone typing it on
+                    # a phone should not have to copy a query string when the
+                    # page asks for the code itself.
                     ui.Button(
-                        f"Open {prompt.verification_url}",
+                        "Open the sign-in page",
                         height=28,
                         clicked_fn=lambda u=url: webbrowser.open(u),
                     )
                     ui.Label(
-                        "Did not open? Type that address into any browser, on "
-                        "this machine or your phone, and enter the code.",
+                        "Did not open? Go to "
+                        f"{_typeable_address(prompt.verification_url)} in any "
+                        "browser, on this machine or your phone, and enter the code.",
                         word_wrap=True,
                         height=0,
                     )
@@ -1240,6 +1363,7 @@ class RunDiffusionPanel:
         if self._tab_collection is not None:
             self._tab_collection.model.set_value(index)
         self._light_tab_rule(index)
+        self._sync_wall_visibility()
         # The bars belong to the runs list this switch is about to destroy.
         self._run_bars = []
         self._run_bar_subscription = None
@@ -1408,9 +1532,21 @@ class RunDiffusionPanel:
                 self._render_results()
 
             self._form_built = self._tool_detail is not None
+            self._ensure_tool_loaded()
             self._sync_viewport_watch()
             # The cost line is in the footer, and the footer is redrawn by the
             # tab switch that got here rather than by this method.
+
+    def _ensure_tool_loaded(self) -> None:
+        """Fetch the selected tool's inputs if the Create tab has none.
+
+        The catalogue can arrive while another tab is open (an account changed
+        from the Account tab, say), and only an open Create tab starts a tool's
+        load. Without this the tab named a tool, showed none of its inputs, and
+        Generate said none was chosen.
+        """
+        if self._tool_detail is None and self._tools and not self._tool_detail_pending:
+            self._spawn(self._load_tool_detail())
 
     def _render_tool_picker(self) -> None:
         """Ask for this to be redrawn on the next frame.
@@ -2798,6 +2934,10 @@ class RunDiffusionPanel:
             load_more=self._load_more_library,
             refresh=self._refresh_library,
         )
+        if not append and self._selected_asset.get(SURFACE_LIBRARY) is None:
+            # The hint under the grid speaks only when there is something to
+            # click, and the row was drawn before this page arrived.
+            self._render_asset_actions(SURFACE_LIBRARY)
 
     def _load_more_library(self) -> None:
         self._spawn(self._load_library(reset=False))
@@ -2844,10 +2984,14 @@ class RunDiffusionPanel:
                         width=90,
                         clicked_fn=load_more,
                     )
-                    # Disabled while a page is in flight as well as when there
-                    # is none to ask for: a second click during the wait would
-                    # spend the same cursor twice and land the same page twice.
+                    # Disabled while a page is in flight: a second click during
+                    # the wait would spend the same cursor twice and land the
+                    # same page twice. Gone once there is nothing left to ask
+                    # for, because a disabled button here looks like an enabled
+                    # one, and "Load more" under an empty or finished list read
+                    # as a promise of more.
                     more.enabled = bool(has_more) and not loading
+                    more.visible = bool(has_more) or loading
                 if message:
                     ui.Label(message, word_wrap=True, height=0)
 
@@ -2894,6 +3038,12 @@ class RunDiffusionPanel:
             lambda s=surface: self._render_asset_actions_now(s),
         )
 
+    def _surface_items(self, surface: str) -> list:
+        """What one surface's grid holds right now."""
+        if surface == SURFACE_LIBRARY:
+            return self._library_items
+        return self._uploads_items
+
     def _render_asset_actions_now(self, surface: str) -> None:
         """The row of actions for the clicked item, with a preview of it.
 
@@ -2908,8 +3058,11 @@ class RunDiffusionPanel:
 
         asset = self._selected_asset.get(surface)
         if asset is None:
-            with frame:
-                ui.Label("Click an image to use, download or open it.", word_wrap=True)
+            # Nothing to click yet, so nothing to say: the grid's own empty
+            # message is the whole story.
+            if self._surface_items(surface):
+                with frame:
+                    ui.Label("Click an image to use, download or open it.", word_wrap=True)
             return
 
         with frame:
@@ -3128,6 +3281,10 @@ class RunDiffusionPanel:
             load_more=self._load_more_uploads,
             refresh=self._refresh_uploads,
         )
+        if not append and self._selected_asset.get(SURFACE_UPLOADS) is None:
+            # The hint under the grid speaks only when there is something to
+            # click, and the row was drawn before this page arrived.
+            self._render_asset_actions(SURFACE_UPLOADS)
 
     def _load_more_uploads(self) -> None:
         self._spawn(self._load_uploads(reset=False))
@@ -3306,9 +3463,16 @@ class RunDiffusionPanel:
                     accounts = self._session.accounts
                     account = self._session.selected_account
                     if account is not None:
+                        # In a sentence the personal account is "yours": its
+                        # label is a name for a picker ("Personal account"),
+                        # and "billed to Personal account" reads as a typo.
+                        payer = (
+                            "your personal account"
+                            if account.is_personal
+                            else _account_label(account)
+                        )
                         ui.Label(
-                            "Runs from this panel are billed to "
-                            f"{_account_label(account)}.",
+                            f"Runs from this panel are billed to {payer}.",
                             word_wrap=True,
                             height=0,
                         )
@@ -3321,20 +3485,36 @@ class RunDiffusionPanel:
                         )
 
                     if account is not None and not account.allows_this_plugin:
+                        fix = _plugin_gate_fix(
+                            account, can_choose_another=len(accounts) > 1
+                        )
                         ui.Label(
-                            "RunDiffusion for Omniverse is not enabled for this "
-                            "account. An account admin can turn it on in team "
-                            "settings.",
+                            "RunDiffusion for Omniverse is not enabled for "
+                            f"{_plugin_gate_subject(account)}."
+                            + (f" {fix}" if fix else ""),
                             word_wrap=True,
                             height=0,
                         )
                     # No balance figure. /me publishes permissions and accounts,
                     # never a token balance, so a number here would be invented.
-                    ui.Button(
-                        "Get tokens",
-                        height=24,
-                        clicked_fn=lambda: webbrowser.open(wall_api.SUBSCRIPTIONS_URL),
-                    )
+                    if account is None or account.is_personal:
+                        ui.Button(
+                            "Get tokens",
+                            height=24,
+                            clicked_fn=lambda: webbrowser.open(wall_api.SUBSCRIPTIONS_URL),
+                        )
+                    else:
+                        # No purchase button for a team. A personal checkout
+                        # cannot top up a team budget, so the button would send
+                        # a member to pay for something that does not reach the
+                        # account their runs are billed to.
+                        ui.Label(
+                            f"{_account_label(account)}'s plan and token budget "
+                            "are managed by your account administrators.",
+                            word_wrap=True,
+                            height=0,
+                            style=_STYLE_HELPER,
+                        )
 
                 with ui.VStack(height=0, spacing=4):
                     ui.Label("PANEL", height=0)
@@ -3617,11 +3797,23 @@ class RunDiffusionPanel:
                 )
             ui.Spacer()
 
-    async def _add_result_to_stage(self, result: SessionResult) -> None:
+    def _ask_size_then_add(self, result: SessionResult) -> None:
+        """Ask how big the asset should be, then put it on the stage.
+
+        Asked before anything is converted or inserted, so cancelling leaves
+        the stage exactly as it was rather than needing an undo.
+        """
+        self._insert_size.show(
+            lambda size, r=result: self._spawn(self._add_result_to_stage(r, size))
+        )
+
+    async def _add_result_to_stage(
+        self, result: SessionResult, size: stage.InsertSize | None = None
+    ) -> None:
         """Put a generated asset on the stage the user has open."""
         self._set_status("Adding to the stage...")
-        path = await stage.add_to_stage(result.path, self._result_dir)
-        if path is None:
+        inserted = await stage.add_to_stage(result.path, self._result_dir, size)
+        if inserted is None:
             # The file is still on disk, so saving it is still an option and
             # saying so is more use than naming the API that refused.
             self._set_error(
@@ -3631,8 +3823,22 @@ class RunDiffusionPanel:
             return
         # Selected, so "added" is something the user can see rather than take
         # on trust: a referenced asset can land anywhere in a large scene.
+        path = inserted.path
         stage.select(path)
-        self._set_status(f"Added to the stage at {path} and selected it. Undo removes it.")
+        if not inserted.sized:
+            # An error rather than a status, because the status line is hidden
+            # by default and this one changes what the user is looking at: an
+            # asset at a size they did not ask for, which reads as a wrong
+            # answer unless something says why.
+            self._set_error(
+                f"Added to the stage at {path}, but it could not be resized, so it "
+                "is at its original size. Undo removes it."
+            )
+            return
+        sized = f", {size.length:g} {size.unit} on its longest side," if size else ""
+        self._set_status(
+            f"Added to the stage at {path}{sized} and selected it. Undo removes it."
+        )
 
     def _view_camera(self, result: SessionResult) -> str | None:
         """The camera a result can send the viewport back to, or None.
@@ -3842,7 +4048,7 @@ class RunDiffusionPanel:
         stage_it = (
             "Add to stage",
             "Add to stage",
-            lambda r=result: self._spawn(self._add_result_to_stage(r)),
+            lambda r=result: self._ask_size_then_add(r),
         )
 
         if result.kind == generate_api.KIND_ASSET_3D:
@@ -4036,22 +4242,47 @@ class RunDiffusionPanel:
     # -- walls -------------------------------------------------------------
 
     def _clear_wall(self) -> None:
+        self._wall_up = False
         if self._wall_frame is not None:
             self._wall_frame.visible = False
 
-    def _render_wall(self, wall: wall_api.TokenWall) -> None:
+    def _sync_wall_visibility(self) -> None:
+        if self._wall_frame is None:
+            return
+        self._wall_frame.visible = self._wall_up and (
+            not self._wall_create_only or self._current_tab == TAB_CREATE
+        )
+
+    def _render_wall(self, wall: wall_api.TokenWall, *, create_tab_only: bool = True) -> None:
         if self._wall_frame is None:
             return
         self._wall_frame.clear()
         with self._wall_frame:
             with ui.VStack(spacing=4, height=0):
-                ui.Label(wall.message, word_wrap=True)
-                if wall.action_label and wall.action_url:
+                ui.Spacer(height=2)
+                ui.Label(wall.message, word_wrap=True, height=0)
+                if wall.detail:
+                    ui.Label(wall.detail, word_wrap=True, height=0, style=_STYLE_HELPER)
+                if wall.switch_to and wall.action_label:
+                    # In the panel, not a link: the fix is a choice this panel
+                    # already offers, and sending someone to a web page to make
+                    # it would be the long way round.
+                    team_id = wall.switch_to
+                    ui.Button(
+                        wall.action_label,
+                        height=26,
+                        style=_STYLE_PRIMARY,
+                        clicked_fn=lambda t=team_id: self._switch_to_account(t),
+                    )
+                elif wall.action_label and wall.action_url:
                     url = wall.action_url
                     ui.Button(
                         wall.action_label, height=24, clicked_fn=lambda: webbrowser.open(url)
                     )
-        self._wall_frame.visible = True
+                ui.Spacer(height=2)
+        self._wall_up = True
+        self._wall_create_only = create_tab_only
+        self._sync_wall_visibility()
 
     def _check_plugin_access(self) -> bool:
         """Say so when this account may not use the plugin, rather than letting
@@ -4065,17 +4296,17 @@ class RunDiffusionPanel:
             self._clear_wall()
             return True
 
-        who = account.label or ("this team" if not account.is_personal else "this account")
         self._render_wall(
             wall_api.TokenWall(
-                message=(
-                    f"RunDiffusion for Omniverse is not enabled for {who}. "
-                    "An account admin can turn it on in team settings."
-                ),
+                message=f"RunDiffusion for Omniverse is not enabled for {_plugin_gate_subject(account)}.",
                 action_label=None,
                 action_url=None,
                 variant="plugin_not_enabled",
-            )
+                detail=_plugin_gate_fix(
+                    account, can_choose_another=len(self._session.accounts) > 1
+                ),
+            ),
+            create_tab_only=False,
         )
         return False
 
@@ -4179,6 +4410,16 @@ class RunDiffusionPanel:
             self._form_values = {}
             self._image_state = {}
             self._capture_state = {}
+            # The next person must not inherit this one's form on their first
+            # account change, nor an estimate asked for this one's account.
+            self._account_carry = None
+            self._team_answers = {}
+            self._catalog_generation += 1
+            self._tool_load_generation += 1
+            self._tool_detail_pending = False
+            if self._cost_task is not None:
+                self._cost_task.cancel()
+                self._cost_task = None
             self._forget_browsing()
             self._current_tab = TAB_CREATE
             # The sign-in screen owns the panel's own window, and it has no
@@ -4215,11 +4456,23 @@ class RunDiffusionPanel:
         # Through the session rather than by assignment, so choosing an
         # account is also remembering it.
         self._session.choose_account(accounts[index].id)
-        # The Account tab spells out who pays, so it is stale the moment this
-        # changes. Rebuilt rather than patched, and safe to rebuild from here
-        # because the picker that fired this lives in the footer instead.
-        if self._current_tab == TAB_ACCOUNT:
-            self._show_tab(TAB_ACCOUNT)
+        # Only a switch a wall offered carries the form, and only to the
+        # account it offered. Choosing in the picker starts over, as it did.
+        carry = self._account_carry
+        if carry is not None and carry.account_id != accounts[index].id:
+            carry = None
+        self._account_carry = carry
+        # Every catalogue and tool load still in the air was asked for the
+        # previous account.
+        self._catalog_generation += 1
+        self._tool_load_generation += 1
+        self._tool_detail_pending = False
+        # An estimate still in the air was asked for the previous account, and
+        # with teams to ask about it can take several round trips to land.
+        if self._cost_task is not None:
+            self._cost_task.cancel()
+            self._cost_task = None
+        self._team_answers = {}
         self._clear_wall()
         self._set_cost("")
         # The account decides which tools exist and who pays, so the list is
@@ -4227,7 +4480,7 @@ class RunDiffusionPanel:
         self._tools = []
         self._kits = []
         self._tool_tags = {}
-        self._selected_tool_id = None
+        self._selected_tool_id = carry.tool_id if carry is not None else None
         self._tool_detail = None
         # The library and the uploads belong to the account too, so what has
         # been paged in is dropped rather than left on screen under a new payer.
@@ -4251,6 +4504,20 @@ class RunDiffusionPanel:
         # Before the access check rather than after it: an account this plugin
         # is not enabled for is exactly the case where someone else's library
         # must not be left on screen.
+        #
+        # One frame later, with the access check and the refetches after it.
+        # Chosen in the dropdown, this runs inside the dropdown's own event,
+        # and these rebuild containers (the Account tab, a torn-out window, the
+        # wall), which omni.ui refuses during dispatch whichever container it
+        # is. The state above changes now; only the drawing waits.
+        self._account_redraws.request("account-change", self._redraw_for_account)
+
+    def _redraw_for_account(self) -> None:
+        """Everything an account change redraws, and the refetches after it."""
+        # The Account tab spells out who pays, so it is stale the moment the
+        # account changes. Rebuilt rather than patched.
+        if self._current_tab == TAB_ACCOUNT:
+            self._show_tab(TAB_ACCOUNT)
         for surface in POPPABLE_SURFACES:
             self._rebuild_surface(surface)
         if not self._check_plugin_access():
@@ -4335,18 +4602,40 @@ class RunDiffusionPanel:
             self._render_filters()
 
     async def _load_tools(self) -> None:
+        generation = self._catalog_generation
+
+        def on_page(tools) -> None:
+            # A page for an account the person has left is not drawn.
+            if generation == self._catalog_generation:
+                self._on_tools_page(tools)
+
         try:
             # Drained in full rather than a page at a time. The browser's search
             # box filters what is loaded, and `/tools` has no text search of its
             # own, so anything short of the whole catalogue makes that box lie.
-            self._tools = await tools_api.list_all_tools(
-                self._session, on_page=self._on_tools_page
-            )
+            tools = await tools_api.list_all_tools(self._session, on_page=on_page)
         except ApiError as error:
+            if generation != self._catalog_generation:
+                return
             logger.warning("RunDiffusion: could not list tools. %s", error.message)
             self._set_error(f"Could not load tools. {error.message}")
             return
+        if generation != self._catalog_generation:
+            return
+        self._tools = tools
 
+        carry = self._account_carry
+        if carry is not None and not self._carry_is_for_selected(carry):
+            carry = self._account_carry = None
+        if (
+            carry is not None
+            and carry.tool is not None
+            and carry.tool_id not in {t.id for t in self._tools}
+        ):
+            # Priced on this account a moment ago, so it runs here even when the
+            # catalogue listing does not carry it: a kit can offer a tool the
+            # listing never shows, the same case `_on_browsed_tool` adopts.
+            self._tools.append(carry.tool)
         if not self._tools:
             return
         if self._current_tab == TAB_CREATE:
@@ -4361,7 +4650,30 @@ class RunDiffusionPanel:
         # Read what is on screen BEFORE tearing it down, so a tool switch keeps
         # the values whose fieldKey exists in both schemas.
         carry_over = self._form.collect() if self._tool_detail is not None else {}
+        # A switch of account a wall offered brings the whole form with it.
+        # Taken once, here, so a later tool change starts from what is on screen.
+        account_carry = self._account_carry
+        self._account_carry = None
+        if account_carry is not None and (
+            account_carry.tool_id != summary.id
+            or not self._carry_is_for_selected(account_carry)
+        ):
+            account_carry = None
+        if account_carry is not None:
+            carry_over = dict(account_carry.values)
 
+        if self._tool_detail is not None and self._tool_detail.id != summary.id:
+            # The wall answered for the tool being replaced. Left up, its
+            # Switch would carry a tool nobody priced on the account it names.
+            self._clear_wall()
+        # So is an estimate still in the air: it priced the tool on screen
+        # until now, and landing after this it would draw that tool's wall.
+        if self._cost_task is not None:
+            self._cost_task.cancel()
+            self._cost_task = None
+        self._tool_load_generation += 1
+        generation = self._tool_load_generation
+        self._tool_detail_pending = True
         self._tool_detail = None
         self._form_frame.clear()
         with self._form_frame:
@@ -4370,11 +4682,21 @@ class RunDiffusionPanel:
         try:
             tool = await tools_api.get_tool(self._session, summary.id)
         except ApiError as error:
+            if generation != self._tool_load_generation:
+                return
+            self._tool_detail_pending = False
+            self._set_cost("")
             self._form_frame.clear()
             with self._form_frame:
                 ui.Label(f"Could not load {summary.name}. {error.message}", word_wrap=True)
             return
 
+        if generation != self._tool_load_generation:
+            # Another tool, another account or a sign-out happened while this
+            # was fetched. Drawn now, this tool and anything carried with it
+            # would land on whatever the panel has moved on to.
+            return
+        self._tool_detail_pending = False
         self._tool_detail = tool
         # An image chosen for the previous tool belongs to that tool's field, so
         # it goes with it rather than following the user to the next one.
@@ -4387,6 +4709,12 @@ class RunDiffusionPanel:
         self._form.build(
             self._form_frame, tool, carry_over, capture_container=self._capture_frame
         )
+        if account_carry is not None:
+            self._form.restore_image_state(account_carry.image_state)
+            self._form.restore_capture_sources(account_carry.capture_sources)
+            self._form_values = dict(carry_over)
+            self._image_state = dict(account_carry.image_state)
+            self._capture_state = dict(account_carry.capture_sources)
         self._form_built = True
         self._sync_viewport_watch()
         # A different tool is a different price, and the line above Generate is
@@ -4398,6 +4726,16 @@ class RunDiffusionPanel:
             self._set_error(
                 f"{tool.name} needs a {unsupported.type} input, which this "
                 "plugin cannot supply yet."
+            )
+        elif account_carry is not None and account_carry.left_behind:
+            # Said whether or not the status line is on: something the person
+            # had on the form is not there any more, and the form gives no
+            # other sign of it.
+            account = self._session.selected_account
+            where = _account_label(account) if account is not None else "this account"
+            self._set_error(
+                "Images you chose from your personal library or uploads were "
+                f"not carried over to {where}."
             )
         else:
             self._set_status("")
@@ -4428,17 +4766,30 @@ class RunDiffusionPanel:
             self._set_cost("")
             return
 
-        self._clear_wall()
+        # Read once, so the estimate, the wall and any team asked about it all
+        # answer the same question.
+        account = self._session.selected_account
+        values = self._form.collect()
+        count = self._requested_results()
+        selections = self._form.image_selections()
+
+        # The wall stays up while the run is re-priced and is replaced, or taken
+        # down, when the answer lands. Clearing it first made it blink on every
+        # pause in typing, and for an account that is blocked it vanished and
+        # came back each time.
         try:
             result = await generate_api.preview_cost(
-                self._session,
-                tool,
-                self._form.collect(),
-                self._requested_results(),
-                image_selections=self._form.image_selections(),
+                self._session, tool, values, count, image_selections=selections
             )
         except ApiError as error:
+            if not self._still_pricing(account, tool):
+                return
+            self._clear_wall()
             self._set_cost(f"Cost unavailable. {error.message}")
+            return
+        if not self._still_pricing(account, tool):
+            # Answered for an account the person has since left, or a tool
+            # they have since replaced. Its price and its wall belong to that.
             return
 
         total = result.get("total_tokens")
@@ -4455,15 +4806,168 @@ class RunDiffusionPanel:
         # panel invented.
         self._set_cost(" · ".join(parts) if parts else "")
 
-        account = self._session.selected_account
+        can_run = bool(result.get("can_run"))
+        is_personal = account.is_personal if account else True
         wall = wall_api.wall_for_preview(
-            can_run=bool(result.get("can_run")),
+            can_run=can_run,
             blocking_reason=result.get("blocking_reason"),
-            is_personal=account.is_personal if account else True,
+            is_personal=is_personal,
             email_verified=self._session.email_verified,
+            account_name=_account_label(account) if account else None,
         )
-        if wall is not None:
+        if wall is not None and wall_api.personal_cannot_pay(
+            is_personal=is_personal,
+            email_verified=self._session.email_verified,
+            blocked_by_preview=not can_run,
+        ):
+            # Asked before anything is drawn, so a team-plan member never sees
+            # an upgrade prompt flash up and get replaced.
+            team = await self._find_team_that_can_run(tool, values, count, selections)
+            if not self._still_pricing(account, tool):
+                return
+            if team is not None:
+                wall = wall_api.switch_wall(team_id=team.id, account_name=_account_label(team))
+        if wall is None:
+            self._clear_wall()
+        else:
             self._render_wall(wall)
+
+    def _still_pricing(self, account, tool) -> bool:
+        """Whether an estimate asked for `account` and `tool` is still wanted."""
+        return (
+            _same_account(account, self._session.selected_account)
+            and self._tool_detail is tool
+        )
+
+    async def _find_team_that_can_run(self, tool, values, count, selections):
+        """The first of the caller's teams that could run this, or None.
+
+        Asked of the server rather than guessed from /me, which says nothing
+        about a team's plan, its balance or whether it is active. Pricing the
+        same run on the team answers all three, for exactly the run on the form,
+        and spends nothing.
+
+        One team at a time, stopping at the first yes: most people have one
+        team, and the ones with several should not spend several requests when
+        the first answer settles it. A team whose request fails is passed over
+        like one that says no. The person then sees the message they would have
+        seen anyway, which is never wrong, only less helpful.
+
+        Priced without the images picked from the personal library or
+        uploads, which a switch leaves behind. Captures are not priced on any
+        account: an estimate is a plain request with no file in it, so a
+        capture has nothing to point at (see `build_inputs`). For a tool that
+        charges per input image, the team is therefore asked about slightly
+        less than the run will cost, and its own estimate after the switch is
+        the same kind of answer the personal account got.
+        """
+        teams = wall_api.teams_worth_checking(self._session.accounts)
+        if not teams:
+            return None
+        carried = {
+            key: [selection for selection in chosen if selection.reference is None]
+            for key, chosen in (selections or {}).items()
+        }
+        carried = {key: chosen for key, chosen in carried.items() if chosen}
+
+        key = (
+            tuple(team.id for team in teams),
+            tool.id,
+            tool.tool_fields_hash,
+            count,
+            repr(sorted(values.items(), key=lambda item: item[0])),
+            tuple(sorted((field_key, len(chosen)) for field_key, chosen in carried.items())),
+        )
+        now = time.monotonic()
+        held = self._team_answers.get(key)
+        if held is not None and now - held[0] < TEAM_ANSWER_SECONDS:
+            return next((team for team in teams if team.id == held[1]), None)
+
+        found = None
+        for team in teams:
+            try:
+                result = await generate_api.preview_cost(
+                    self._session, tool, values, count, image_selections=carried, account=team
+                )
+            except ApiError as error:
+                logger.info(
+                    "RunDiffusion: could not price this run on another account (%s).",
+                    error.code or error.status,
+                )
+                continue
+            if result.get("can_run"):
+                found = team
+                break
+        # Only the newest question is worth keeping: an older form's answer is
+        # never asked about again.
+        self._team_answers = {key: (now, found.id if found is not None else None)}
+        return found
+
+    def _switch_to_account(self, account_id: str) -> None:
+        """Bill to `account_id`, taking the Create tab's work along.
+
+        Reached from a wall's Switch button. Goes through the footer's picker,
+        so the switch takes exactly the path a person choosing the account
+        there would, and BILLED TO shows the new account the moment it happens.
+        """
+        # The form is read now, on the click, and the switch itself waits a
+        # frame. Setting the picker runs the whole account change inside this
+        # button's dispatch, and part of that can redraw the wall the button
+        # sits in, which omni.ui refuses while the click is still being
+        # handled (see redraw.py).
+        carry = self._carry_for(account_id)
+        self._account_redraws.request(
+            "account-switch", lambda: self._apply_account_switch(account_id, carry)
+        )
+
+    def _apply_account_switch(self, account_id: str, carry) -> None:
+        accounts = self._session.accounts
+        index = next((i for i, a in enumerate(accounts) if a.id == account_id), None)
+        if index is None or self._account_combo is None:
+            self._set_error("That account is no longer available. Choose one under BILLED TO.")
+            return
+        self._account_carry = carry
+        self._account_combo.model.get_item_value_model().set_value(index)
+
+    def _carry_is_for_selected(self, carry) -> bool:
+        account = self._session.selected_account
+        return account is not None and account.id == carry.account_id
+
+    def _carry_for(self, account_id: str) -> _AccountCarry | None:
+        """The Create tab's tool and inputs, ready to follow a switch."""
+        tool = self._tool_detail
+        if tool is None:
+            return None
+        if self._form_built:
+            values = dict(self._form.collect())
+            image_state = self._form.export_image_state()
+            capture_sources = self._form.export_capture_sources()
+        else:
+            values = dict(self._form_values)
+            image_state = dict(self._image_state)
+            capture_sources = dict(self._capture_state)
+        # A slot's reference is None for a capture and names a library or
+        # uploads item otherwise. See `ToolForm.export_image_state`.
+        captures = {
+            key: [slot for slot in slots if slot[1] is None]
+            for key, slots in image_state.items()
+        }
+        chosen = sum(len(slots) for slots in image_state.values())
+        kept = sum(len(slots) for slots in captures.values())
+        # The summary for THIS tool, which `_selected_tool` is not while a tool
+        # change is still loading.
+        summary = next((t for t in self._tools if t.id == tool.id), None)
+        if summary is None:
+            summary = tools_api.ToolSummary(id=tool.id, name=tool.name)
+        return _AccountCarry(
+            account_id=account_id,
+            tool_id=tool.id,
+            tool=summary,
+            values=values,
+            image_state=captures,
+            capture_sources=capture_sources,
+            left_behind=chosen - kept,
+        )
 
     def _on_generate_clicked(self) -> None:
         """Start a run. It stacks rather than replacing whatever is in flight.
@@ -4501,14 +5005,23 @@ class RunDiffusionPanel:
         image_state = self._form.export_image_state()
         count = self._requested_results()
 
+        # Who pays is read on the click too. A refusal is about the account the
+        # run was sent under, which is not always the one selected when the
+        # answer comes back.
+        account = self._session.selected_account
+
         self._clear_wall()
         self._jobs.submit(
             tool.name,
-            lambda job: self._run_job(job, tool, values, selections, count, image_state),
+            lambda job: self._run_job(
+                job, tool, values, selections, count, image_state, account
+            ),
             prompt=prompt_text(tool, values),
         )
 
-    async def _run_job(self, job, tool, values, selections, count, image_state) -> list:
+    async def _run_job(
+        self, job, tool, values, selections, count, image_state, account=None
+    ) -> list:
         """One generation, start to finish. Returns its results.
 
         No capture happens here. Every image was taken or chosen before the
@@ -4526,7 +5039,7 @@ class RunDiffusionPanel:
         self._jobs.update(job, "submitting")
         try:
             request_id = await generate_api.submit(
-                self._session, tool, values, count, image_selections=selections
+                self._session, tool, values, count, image_selections=selections, account=account
             )
         except ApiError as error:
             if error.code == "TOOL_SCHEMA_STALE":
@@ -4541,17 +5054,38 @@ class RunDiffusionPanel:
             # A token block can appear here even after a clean preview: the
             # balance moves, and preview-cost is advisory rather than a
             # reservation. Same two-axis routing either way.
-            account = self._session.selected_account
+            is_personal = account.is_personal if account else True
             wall = wall_api.wall_for_error(
                 error.code,
                 error.status,
-                is_personal=account.is_personal if account else True,
+                is_personal=is_personal,
                 email_verified=self._session.email_verified,
+                account_name=_account_label(account) if account else None,
             )
-            if wall is not None:
+            if wall is None:
+                raise
+            if wall_api.personal_cannot_pay(
+                is_personal=is_personal,
+                email_verified=self._session.email_verified,
+                error_code=error.code,
+                status=error.status,
+            ):
+                team = await self._find_team_that_can_run(tool, values, count, selections)
+                if team is not None:
+                    wall = wall_api.switch_wall(
+                        team_id=team.id, account_name=_account_label(team)
+                    )
+            # Drawn only while the account it is about is still the one being
+            # billed. Shown after a switch, it would put the account the person
+            # left over the form of the one they chose.
+            # And only while the form still shows the tool it is about: a
+            # Switch drawn over another tool would carry that one instead.
+            on_screen = self._tool_detail
+            if _same_account(account, self._session.selected_account) and (
+                on_screen is not None and on_screen.id == tool.id
+            ):
                 self._render_wall(wall)
-                raise RuntimeError(wall.message) from None
-            raise
+            raise RuntimeError(wall.message) from None
 
         job.request_id = request_id
         self._jobs.update(job, "queued")
@@ -4559,6 +5093,7 @@ class RunDiffusionPanel:
             self._session,
             request_id,
             on_status=lambda state: self._jobs.update(job, state),
+            account=account,
         )
 
         if not result.succeeded:

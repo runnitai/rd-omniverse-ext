@@ -579,6 +579,12 @@ class TestSigningOut:
         panel._kits = []
         panel._selected_tool_id = None
         panel._tool_detail = None
+        panel._account_carry = None
+        panel._team_answers = {}
+        panel._cost_task = None
+        panel._catalog_generation = 0
+        panel._tool_load_generation = 0
+        panel._tool_detail_pending = False
         panel.rendered = []
         panel._render_signed_out = lambda: panel.rendered.append("signed-out")
         panel.stopped: list = []
@@ -607,6 +613,26 @@ class TestSigningOut:
         _run(panel._sign_out())
 
         assert [w.destroyed for w in windows.values()] == [1, 1]
+
+    def test_the_next_person_inherits_no_switch(self):
+        """A form on its way to another account, an estimate in the air and
+        the teams' answers all belong to the person signing out."""
+        panel = self._signed_out_panel(_only("library"))
+        cancelled = []
+        panel._account_carry = object()
+        panel._team_answers = {"question": (0.0, "t1")}
+        panel._cost_task = type("T", (), {"cancel": lambda _s: cancelled.append(True)})()
+
+        _run(panel._sign_out())
+
+        assert panel._account_carry is None
+        assert panel._team_answers == {}
+        assert panel._cost_task is None
+        assert cancelled == [True]
+        # And a catalogue or tool still being fetched for them is dropped
+        # when it lands.
+        assert panel._catalog_generation == 1
+        assert panel._tool_load_generation == 1
 
     @BOTH
     def test_it_does_not_read_as_the_user_docking_it(self, surface):

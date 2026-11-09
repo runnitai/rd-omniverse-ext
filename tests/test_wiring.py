@@ -538,11 +538,16 @@ def test_dropping_what_a_surface_holds_goes_on_to_show_it_again():
     `_rebuild_surface`, or the surface goes on showing a list that is no longer
     true. Rebuilding the TAB is not enough: a window is never rebuilt by a
     visit."""
-    for method_name in ("_send_to_rundiffusion", "_on_account_changed"):
+    for method_name in ("_send_to_rundiffusion", "_redraw_for_account"):
         method = _method("RunDiffusionPanel", method_name)
         assert "_rebuild_surface" in _calls_in(method), (
             f"{method_name} drops held pages without showing the surface again"
         )
+    # An account change draws one frame later, through that method.
+    change = _method("RunDiffusionPanel", "_on_account_changed")
+    assert "_redraw_for_account" in ast.unparse(change), (
+        "_on_account_changed drops held pages and never books the redraw"
+    )
 
 
 def test_the_window_can_build_either_surface():

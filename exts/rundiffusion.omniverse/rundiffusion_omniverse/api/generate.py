@@ -177,7 +177,30 @@ async def preview_cost(
     is spent and nothing is selected: it only answers whether that account
     could run this.
     """
-    body = {
+    body = preview_cost_body(tool, values, num_results, image_selections)
+    with session.account_request(account):
+        return await request_json_async(
+            "POST",
+            with_query(f"{api_base_url()}/generate/preview-cost", session.account_params(account)),
+            body=body,
+            headers=await session.auth_headers(),
+        )
+
+
+def preview_cost_body(
+    tool: ToolDetail,
+    values: dict,
+    num_results: int = 1,
+    image_selections: dict[str, list[ImageSelection]] | None = None,
+) -> dict:
+    """The body `preview_cost` sends, built without sending it.
+
+    Its own function so a caller can tell whether two estimates would ask the
+    same question, and so the answer is read off the very body that goes out
+    rather than off a second copy of how it is built. The same body for the
+    same account gets the same answer.
+    """
+    return {
         "tool_id": tool.id,
         "tool_fields_hash": tool.tool_fields_hash,
         "inputs": build_inputs(
@@ -185,12 +208,6 @@ async def preview_cost(
         ),
         "num_results": num_results,
     }
-    return await request_json_async(
-        "POST",
-        with_query(f"{api_base_url()}/generate/preview-cost", session.account_params(account)),
-        body=body,
-        headers=await session.auth_headers(),
-    )
 
 
 def capture_file_parts(pngs: list[bytes]) -> list[tuple[str, str, bytes, str]]:
@@ -263,12 +280,13 @@ async def submit(
         json.dumps(body.get("inputs"), default=str)[:2000],
     )
 
-    payload = await post_multipart_async(
-        with_query(f"{api_base_url()}/generate", session.account_params(account)),
-        fields={"payload": json.dumps(body)},
-        files=capture_file_parts(captures),
-        headers=headers,
-    )
+    with session.account_request(account):
+        payload = await post_multipart_async(
+            with_query(f"{api_base_url()}/generate", session.account_params(account)),
+            fields={"payload": json.dumps(body)},
+            files=capture_file_parts(captures),
+            headers=headers,
+        )
     return payload["request_id"]
 
 
@@ -294,11 +312,12 @@ async def poll_until_done(
     delay = 2
 
     while True:
-        payload: dict[str, Any] = await request_json_async(
-            "GET",
-            with_query(f"{api_base_url()}/generate/{request_id}", session.account_params(account)),
-            headers=await session.auth_headers(),
-        )
+        with session.account_request(account):
+            payload: dict[str, Any] = await request_json_async(
+                "GET",
+                with_query(f"{api_base_url()}/generate/{request_id}", session.account_params(account)),
+                headers=await session.auth_headers(),
+            )
         status = str(payload.get("status") or "")
 
         if status in TERMINAL_STATES:

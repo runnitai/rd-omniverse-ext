@@ -149,10 +149,19 @@ class TestPersonalPlanWall:
         assert wall.variant == VARIANT_GET_PLAN
         assert wall.action_url == SUBSCRIPTIONS_URL
 
-    def test_unverified_still_wins_over_the_plan(self):
+    def test_a_plan_refusal_is_about_the_plan_whatever_the_email_flag_says(self):
+        """The server refuses an unverified email before anything else, with
+        its own code. A plan refusal therefore means the email was accepted,
+        and the flag the panel holds is stale; sending this caller to verify
+        would answer a question the server did not ask."""
         wall = wall_for_error(
             "FREEMIUM_API_NOT_ALLOWED", 403, is_personal=True, email_verified=False
         )
+
+        assert wall.variant == VARIANT_GET_PLAN
+
+    def test_the_verify_refusal_still_goes_to_verification(self):
+        wall = wall_for_error("EMAIL_NOT_VERIFIED", 403, is_personal=True, email_verified=False)
 
         assert wall.variant == VARIANT_VERIFY
 
@@ -186,10 +195,14 @@ class TestWhichTeams:
 
         assert teams_worth_checking(accounts) == [ALPHA, BETA]
 
-    def test_a_role_that_publishes_nothing_is_left_to_the_server(self):
+    def test_a_role_that_publishes_nothing_is_not_asked(self):
+        """This used to be left to the server, and the server says no: a team
+        account with no USE_PLUGINS or plugin kinds is refused at the plugin
+        gate, and Generate needs an explicit GENERATE. Asking such a team only
+        spent a request on an answer the panel would not act on."""
         quiet = Account(id="t9", label="Quiet", kind="TEAM")
 
-        assert teams_worth_checking([quiet]) == [quiet]
+        assert teams_worth_checking([quiet]) == []
 
 
 def test_no_wall_copy_has_an_em_dash():
@@ -313,6 +326,8 @@ def _panel(session, form=None) -> RunDiffusionPanel:
     panel._redraws = ImmediateRedraws()
     panel._account_redraws = ImmediateRedraws()
     panel._cost_task = None
+    panel._estimate_generation = 0
+    panel._cost_request = None
     panel._catalog_generation = 0
     panel._tool_load_generation = 0
     panel._tool_detail_pending = False
@@ -644,6 +659,11 @@ class TestPickerChoice:
         panel._show_tab = lambda _index: None
         panel._check_plugin_access = lambda: False
         panel._cost_task = None
+        # The redraw closes an open tool browser and re-reads the account list
+        # before refetching; neither is what these tests are about.
+        panel._tool_browser = types.SimpleNamespace(close=lambda: None)
+        panel._spawn = lambda coroutine: coroutine.close()
+        panel._cost_request = None
         return panel
 
     def test_a_switch_the_wall_offered_keeps_the_tool(self):
@@ -933,7 +953,9 @@ class TestTheSwitchEndToEnd:
         panel._spawn = spawned.append
         panel._account_combo = FakeCombo(0, panel._on_account_changed)
         panel._render_tool_picker = lambda: None
-        panel._tool_browser = types.SimpleNamespace(update_tools=lambda _tools: None)
+        panel._tool_browser = types.SimpleNamespace(
+            update_tools=lambda _tools: None, close=lambda: None
+        )
         panel._capture_frame = None
         panel._chosen_assets = {}
         panel._sync_viewport_watch = lambda: None

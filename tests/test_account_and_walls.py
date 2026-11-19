@@ -8,6 +8,7 @@ button. Neither would fail loudly.
 
 from __future__ import annotations
 
+from rundiffusion_omniverse.api import token_wall
 from rundiffusion_omniverse.api.session import Account, RdSession
 from rundiffusion_omniverse.api.token_wall import (
     SUBSCRIPTIONS_URL,
@@ -211,9 +212,36 @@ class TestPluginAccessGate:
 
         assert not account.allows_this_plugin
 
-    def test_an_absent_list_stays_permissive(self):
-        """No published list is not a denial. The server is the authority, so
-        the call is left to be the thing that refuses."""
+    def test_a_personal_account_publishing_nothing_is_still_allowed(self):
+        """Because it is personal, not because nothing was published: the
+        server never gates a personal account, which has no role to consult."""
         account = Account(id="p1", label="Personal", kind="PERSONAL")
 
         assert account.allows_this_plugin
+
+    def test_a_team_publishing_nothing_is_denied(self):
+        """This used to be read as permissive, leaving the server to refuse.
+        The server does refuse a team account with no USE_PLUGINS or no plugin
+        kinds, so the panel says so up front instead of failing on the first
+        call."""
+        assert not Account(id="t1", label="Acme", kind="TEAM").allows_this_plugin
+        assert not Account(
+            id="t1", label="Acme", kind="TEAM", permissions={"USE_PLUGINS": True}
+        ).allows_this_plugin
+
+
+class TestATeamTakenAway:
+    """Said when the selected team turns out to be gone and runs move to the
+    personal account. It names the team that went, so the account now paying
+    is not blamed for something it did not do."""
+
+    def test_it_names_the_team_that_went_and_who_pays_now(self):
+        message = token_wall.account_gone_message(account_name="Acme")
+
+        assert message.startswith("Acme ")
+        assert "personal account" in message
+
+    def test_a_team_with_no_name_is_called_what_its_company_calls_one(self):
+        message = token_wall.account_gone_message(account_name=None, team_label="Studio")
+
+        assert message.startswith("This Studio ")

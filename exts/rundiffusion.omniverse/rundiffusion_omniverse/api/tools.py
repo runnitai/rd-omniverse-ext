@@ -67,9 +67,29 @@ class ToolSummary:
     #: it can be fetched without auth headers and cached like any other image.
     avatar_url: str | None = None
     description: str | None = None
+    #: The ids of the tool's catalogue tags. A team role can block tools by
+    #: tag, so these decide whether this account may see the tool at all.
+    tool_tag_ids: tuple[str, ...] = ()
 
     def __str__(self) -> str:  # what the picker shows
         return self.name or self.id
+
+
+def tool_tag_ids(raw: Any) -> tuple[str, ...]:
+    """The ids in a tool's `tool_tags`, which arrive as `{id, type, label}`.
+
+    Read defensively, with a bare id string still accepted, because what reads
+    these is the role's tool blocking, and failing open there is the expensive
+    direction: it shows a tool the team blocked.
+    """
+    if not isinstance(raw, list):
+        return ()
+    ids = []
+    for tag in raw:
+        tag_id = tag.get("id") if isinstance(tag, dict) else tag
+        if isinstance(tag_id, str) and tag_id:
+            ids.append(tag_id)
+    return tuple(ids)
 
 
 @dataclass
@@ -96,6 +116,10 @@ class ToolDetail:
     #: what requests are built from; this is what the form renders, because
     #: grouping and order are part of how a tool asks to be filled in.
     tree: list = field(default_factory=list)
+    #: The same tag ids the catalogue listing carries. Read again here because
+    #: a tool can reach the form without a listing (carried across accounts),
+    #: and the role's tool blocking needs them either way.
+    tool_tag_ids: tuple[str, ...] = ()
 
     @property
     def prompt_field(self) -> ToolField | None:
@@ -234,14 +258,15 @@ async def list_all_tools(session: RdSession, on_page=None) -> list[ToolSummary]:
 async def list_tools(
     session: RdSession, limit: int = 50, *, cursor: str | None = None
 ) -> ToolPage:
-    payload = await request_json_async(
-        "GET",
-        with_query(
-            f"{api_base_url()}/tools",
-            {"limit": limit, "cursor": cursor, **session.account_params()},
-        ),
-        headers=await session.auth_headers(),
-    )
+    with session.account_request():
+        payload = await request_json_async(
+            "GET",
+            with_query(
+                f"{api_base_url()}/tools",
+                {"limit": limit, "cursor": cursor, **session.account_params()},
+            ),
+            headers=await session.auth_headers(),
+        )
     payload = payload or {}
     return ToolPage(
         items=[
@@ -250,6 +275,7 @@ async def list_tools(
                 name=item.get("name") or item["id"],
                 avatar_url=item.get("avatar_url"),
                 description=item.get("description"),
+                tool_tag_ids=tool_tag_ids(item.get("tool_tags")),
             )
             for item in payload.get("data") or []
         ],
@@ -261,11 +287,12 @@ async def list_tools(
 
 
 async def get_tool(session: RdSession, tool_id: str) -> ToolDetail:
-    payload = await request_json_async(
-        "GET",
-        with_query(f"{api_base_url()}/tools/{tool_id}", session.account_params()),
-        headers=await session.auth_headers(),
-    )
+    with session.account_request():
+        payload = await request_json_async(
+            "GET",
+            with_query(f"{api_base_url()}/tools/{tool_id}", session.account_params()),
+            headers=await session.auth_headers(),
+        )
     fields: list[ToolField] = []
     _walk_fields(payload.get("fields") or [], fields)
     return ToolDetail(
@@ -276,6 +303,7 @@ async def get_tool(session: RdSession, tool_id: str) -> ToolDetail:
         tool_fields_hash=payload["tool_fields_hash"],
         fields=fields,
         tree=payload.get("fields") or [],
+        tool_tag_ids=tool_tag_ids(payload.get("tool_tags")),
     )
 
 

@@ -72,11 +72,12 @@ async def list_tool_tags(session: RdSession) -> list[ToolTag]:
     an object, are both a `TypeError` on the way to a filter nobody needs.
     """
     try:
-        payload = await request_json_async(
-            "GET",
-            with_query(f"{api_base_url()}/tool-tags", session.account_params()),
-            headers=await session.auth_headers(),
-        )
+        with session.account_request():
+            payload = await request_json_async(
+                "GET",
+                with_query(f"{api_base_url()}/tool-tags", session.account_params()),
+                headers=await session.auth_headers(),
+            )
         rows = (payload or {}).get("data") or []
         return [
             ToolTag(

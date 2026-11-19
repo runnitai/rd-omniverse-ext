@@ -14,11 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
 from rundiffusion_omniverse.api import token_store
+from rundiffusion_omniverse.api import tools as tools_api
 from rundiffusion_omniverse.api.session import Account, RdSession
+from rundiffusion_omniverse.api.transport import ApiError
+
+class ClosingBrowser:
+    """The tool browser, as far as an account change reaches it."""
+
+    def close(self) -> None:
+        return None
+
 
 class ImmediateRedraws:
     """Runs a deferred redraw at once, so a test can see what it did."""
@@ -209,6 +219,51 @@ class TestSigningOut:
         assert store.cleared
 
 
+class TestATeamTakenAwayWhileOpen:
+    """The same loss of a team as in TestRestoring, found out a different way:
+    not at start, but from a request the server refuses while Kit is open."""
+
+    def _refused_on_the_team(self, store, monkeypatch):
+        session = _signed_in(store, PERSONAL, TEAM)
+        session.id_token = "id"
+        session.expires_at = int(time.time()) + 3600
+        session.choose_account("t1")
+        asked = []
+        session.on_account_gone = lambda account, reread: asked.append((account, reread))
+
+        async def refuse(*_args, **_kwargs):
+            raise ApiError(403, "ACCOUNT_NOT_MEMBER", "Not a member of that team.")
+
+        monkeypatch.setattr(tools_api, "request_json_async", refuse)
+        with pytest.raises(ApiError):
+            asyncio.run(tools_api.list_tools(session))
+        return session, asked
+
+    def test_the_refusal_alone_forgets_nothing(self, store, monkeypatch):
+        """It asks for the account list. Until that answers, the team is still
+        what was chosen, on screen and on disk."""
+        session, asked = self._refused_on_the_team(store, monkeypatch)
+
+        assert [account for account, _reread in asked] == [TEAM]
+        assert session.selected_account_id == "t1"
+        assert store.stored.selected_account_id == "t1"
+
+    def test_a_list_without_the_team_forgets_it_on_disk_too(self, store, monkeypatch):
+        """Otherwise the next launch would restore the dead team and spend its
+        first request finding out again."""
+        session, asked = self._refused_on_the_team(store, monkeypatch)
+        [(_account, reread)] = asked
+
+        session.finish_accounts_refresh(
+            reread,
+            {"accounts": [{"id": "p1", "label": "Personal", "kind": "PERSONAL"}]},
+        )
+
+        assert session.selected_account.is_personal
+        assert store.stored.selected_account_id is None
+        assert store.stored.refresh_token == "refresh-1"
+
+
 class TestWhatIsWrittenToDisk:
     """The sealing is Windows DPAPI; the payload is plain JSON inside it.
 
@@ -309,8 +364,13 @@ class TestThePickerActuallyChooses:
         panel._set_cost = lambda _message: None
         panel._show_tab = lambda _index: None
         panel._check_plugin_access = lambda: False  # stops before the refetches
+        # The redraw closes an open tool browser and re-reads the account list
+        # before refetching; neither is what these tests are about.
+        panel._tool_browser = ClosingBrowser()
+        panel._spawn = lambda coroutine: coroutine.close()
         panel._account_carry = None
         panel._cost_task = None
+        panel._cost_request = None
         panel._team_answers = {}
         panel._account_redraws = ImmediateRedraws()
         panel._catalog_generation = 0
@@ -392,8 +452,11 @@ class TestSwitchingAccountWithASurfaceTornOut:
         panel._set_cost = lambda _message: None
         panel._show_tab = lambda _index: None
         panel._check_plugin_access = lambda: False
+        panel._tool_browser = ClosingBrowser()
+        panel._spawn = lambda coroutine: coroutine.close()
         panel._account_carry = None
         panel._cost_task = None
+        panel._cost_request = None
         panel._team_answers = {}
         panel._account_redraws = ImmediateRedraws()
         panel._catalog_generation = 0

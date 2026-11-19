@@ -316,6 +316,15 @@ class ToolBrowser:
         self._sweep_task = None
         self._kits: list[kits_api.Kit] = []
         self._kits_state = self.KITS_LOADING
+        #: The rule this window was opened with for tools to leave out: the
+        #: account's role's blocked tools when choosing a tool to run, nothing
+        #: when filtering the library (past results of a blocked tool are still
+        #: there). Applied to every list it is given, and to kits it fetches.
+        self._hides = None
+        #: Which opening a kit fetch belongs to. Moved on by every `show` and
+        #: `close`, so kits fetched for one account, landing after the window
+        #: was closed and reopened on another, are dropped rather than shown.
+        self._kits_generation = 0
         #: Which kit the grid is filtered to, and which of its tabs. None means
         #: every tool.
         self._open_kit: kits_api.Kit | None = None
@@ -365,6 +374,7 @@ class ToolBrowser:
         on_pick,
         *,
         kits: list[kits_api.Kit] | None = None,
+        hides=None,
     ) -> None:
         """`on_pick` receives the chosen ToolSummary.
 
@@ -372,8 +382,15 @@ class ToolBrowser:
         has them the pills are there on the first frame; when it does not this
         window falls back to fetching its own, which is what happens if the
         prefetch failed or has not landed yet.
+
+        `hides` says which tools to leave out, and is kept for everything this
+        window is given or fetches while it is open: a longer catalogue as it
+        drains, and kits, which would otherwise bring a hidden tool back one
+        kit card away.
         """
-        self._tools = list(tools)
+        self._hides = hides
+        self._kits_generation += 1
+        self._tools = self._visible(tools)
         self._on_pick = on_pick
         # Opened fresh each time rather than where it was left. The window is a
         # way of answering "which tool", and resuming inside yesterday's filter
@@ -427,7 +444,7 @@ class ToolBrowser:
         # Refetched only when the panel has nothing to give. The curation is
         # per account, and the panel drops what it holds on an account change,
         # so an empty list here means "not loaded", never "loaded and empty".
-        self._kits = list(kits or [])
+        self._kits = self._visible_kits(kits or [])
         self._kits_state = self.KITS_READY if self._kits else self.KITS_LOADING
         # A booking made against the previous body must not suppress this one.
         self._render_pending = False
@@ -456,17 +473,45 @@ class ToolBrowser:
         except Exception:  # noqa: BLE001 - an unfocused box still works
             logger.debug("RunDiffusion: could not focus the tool search.")
 
+    def close(self) -> None:
+        """Hide the window, for an account change or a sign-out.
+
+        What it shows (the catalogue, the kits, the kit it has open) and the
+        choice it would report all belong to the account being left, so it is
+        closed rather than left offering them. `show` starts it fresh.
+
+        Kits still being fetched are let go of, and the choice it would report
+        is forgotten, so neither reaches whatever the panel shows next.
+        """
+        self._kits_generation += 1
+        self._on_pick = None
+        if self._window is not None:
+            self._window.visible = False
+
+    def _visible(self, tools) -> list:
+        if self._hides is None:
+            return list(tools)
+        return [tool for tool in tools if not self._hides(tool)]
+
+    def _visible_kits(self, kits) -> list:
+        if self._hides is None:
+            return list(kits)
+        return kits_api.visible_kits(kits, self._hides)
+
     def _spawn(self, coroutine) -> None:
         task = asyncio.ensure_future(coroutine)
         self._tasks.add(task)
         task.add_done_callback(_task_finished(self._tasks))
 
     async def _load_kits(self) -> None:
+        generation = self._kits_generation
         try:
-            self._kits = await kits_api.list_kits(self._session)
+            kits = await kits_api.list_kits(self._session)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - the flat list still works
+            if generation != self._kits_generation:
+                return
             # Includes the 403 an account without this plugin enabled gets. The
             # window degrades to the catalogue rather than explaining a gate
             # that the panel's own wall explains better.
@@ -475,6 +520,11 @@ class ToolBrowser:
             self._render()
             return
 
+        if generation != self._kits_generation:
+            # Asked for an opening that has since been closed, very likely on
+            # another account. Those kits are not this window's to show.
+            return
+        self._kits = self._visible_kits(kits)
         self._kits_state = self.KITS_READY
         self._render()
 
@@ -987,12 +1037,16 @@ class ToolBrowser:
         The panel drains `/tools` over several round trips and calls this after
         each. Ignored while closed, because `show` takes the list again anyway
         and rebuilding an invisible window is work nobody sees.
+
+        Compared by id, not by length: a list of the same length can hold
+        different tools, and skipping it left the old ones on screen.
         """
         if self._window is None or not self._window.visible:
             return
-        if len(tools) == len(self._tools):
+        tools = self._visible(tools)
+        if [tool.id for tool in tools] == [tool.id for tool in self._tools]:
             return
-        self._tools = list(tools)
+        self._tools = tools
         self._render()
 
     def _build_tool_card(self, tool: tools_api.ToolSummary) -> None:

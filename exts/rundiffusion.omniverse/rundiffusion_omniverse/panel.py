@@ -20,6 +20,7 @@ buying nothing.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import tempfile
@@ -56,6 +57,7 @@ from .theme import (
     CELL_EMPTY as _CELL_EMPTY,
     DANGER as _DANGER,
     HAIRLINE as _HAIRLINE,
+    QUIET_FILL as _QUIET_FILL,
     RUN_BAR as _RUN_BAR,
     RUN_TRACK as _RUN_TRACK,
     SEPARATOR as _SEPARATOR,
@@ -109,7 +111,7 @@ SURFACE_WINDOW_TITLES = {
 #: Shown on the Account tab and the sign-in screen. Kept in step with
 #: config/extension.toml by the test suite, because a version that lies is worse
 #: than no version at all.
-EXTENSION_VERSION = "0.4.0"
+EXTENSION_VERSION = "0.4.1"
 
 #: Output kinds the panel keeps a local copy of. Everything here can be saved
 #: and sent even where it cannot be drawn, which is the difference between a
@@ -263,6 +265,16 @@ _STYLE_PRIMARY = {
     "font_size": 15,
     "border_radius": 4,
 }
+#: Generate while this account may not start a run. omni.ui draws a disabled
+#: button exactly like an enabled one, so the state has to be in the style too:
+#: otherwise the one button that spends money looks ready and does nothing.
+_STYLE_PRIMARY_UNAVAILABLE = {
+    "background_color": _QUIET_FILL,
+    "background_color_hovered": _QUIET_FILL,
+    "color": _TEXT_SECONDARY,
+    "font_size": 15,
+    "border_radius": 4,
+}
 _STYLE_SECONDARY = {
     "background_color": _TRANSPARENT,
     "border_color": _HAIRLINE,
@@ -315,6 +327,14 @@ COST_DEBOUNCE_SECONDS = 0.6
 #: on the web shows up without a restart.
 TEAM_ANSWER_SECONDS = 30.0
 
+#: How long the estimate for an unchanged form is trusted, for the same two
+#: reasons. Within it, the same question (the same request body for the same
+#: account) is answered from the estimate already drawn: coming back to the
+#: Create tab, or putting a value back the way it was, asks nothing. Past it,
+#: the next change or visit asks again. Nothing re-prices on a timer, so this
+#: only ever lets a person's own action through, never a loop.
+COST_QUOTE_SECONDS = 30.0
+
 
 def _account_label(account) -> str:
     """What to call an account wherever one is named.
@@ -337,6 +357,12 @@ def _same_account(one, other) -> bool:
         return None if account is None or account.is_personal else account.id
 
     return key(one) == key(other)
+
+
+def _account_list_shape(accounts) -> list:
+    """What BILLED TO draws from the account list: which accounts, in which
+    order, under which names. A change to any of it redraws the picker."""
+    return [(account.id, account.kind, account.label) for account in accounts]
 
 
 def _plugin_gate_subject(account) -> str:
@@ -389,6 +415,39 @@ class _AccountCarry:
     capture_sources: dict = field(default_factory=dict)
     #: How many chosen images stayed behind, so the panel can say so.
     left_behind: int = 0
+
+
+@dataclass
+class _CostQuestion:
+    """The Create tab as one estimate asks about it, read once.
+
+    The estimate, the wall and any team asked about it all answer this one
+    question, so it is read in one place rather than once per answer.
+
+    `key` is the question as the server receives it: the account it is asked
+    for and the exact body sent. Two questions with the same key get the same
+    answer, which is what lets the second one go unasked.
+    """
+
+    tool: Any
+    account: Any
+    values: dict
+    count: int
+    selections: dict
+    key: tuple
+
+
+@dataclass
+class _CostQuote:
+    """An estimate that landed and was drawn: what it answered, and how."""
+
+    key: tuple
+    #: `time.monotonic()` when it landed, so an old one is asked again.
+    landed_at: float
+    #: The cost line it set.
+    message: str
+    #: The wall it drew, or None for none.
+    wall: Any = None
 
 
 def _typeable_address(url: str) -> str:
@@ -552,7 +611,7 @@ class RunDiffusionPanel:
     """Owns the window and everything in it for the life of the extension."""
 
     def __init__(self) -> None:
-        self._session = RdSession()
+        self._session = RdSession(on_account_gone=self._account_gone)
         self._window = ui.Window(WINDOW_TITLE, width=420, height=720)
 
         # Shared chrome
@@ -644,12 +703,22 @@ class RunDiffusionPanel:
         self._show_status_log = prefs.get_bool(prefs.SHOW_STATUS_LOG)
 
         # State
+        #: The tools this account may run: the catalogue without the ones its
+        #: role blocks, plus any a kit offered that the listing did not carry.
         self._tools: list[tools_api.ToolSummary] = []
+        #: The catalogue as listed, blocked tools included. Filtering the
+        #: library is not running a tool, and past results of a tool the role
+        #: now blocks are still in it, so the library's tool filter reads this.
+        #: It is also how "the role hides every tool" is told from "not loaded".
+        self._catalog: list[tools_api.ToolSummary] = []
         #: The kit curation, fetched with the tools rather than when the
         #: browser opens. Both are account-scoped and the browser is a
         #: reader of them, so making it fetch its own left it showing an
         #: empty grid for a round trip every single time it was opened.
+        #: Without the tools the role blocks; `_all_kits` keeps them, for the
+        #: library's tool filter.
         self._kits: list[kits_api.Kit] = []
+        self._all_kits: list[kits_api.Kit] = []
         self._session_results: list[SessionResult] = []
         self._tasks: set[asyncio.Task] = set()
         self._result_dir = Path(tempfile.mkdtemp(prefix="rundiffusion-"))
@@ -731,6 +800,24 @@ class RunDiffusionPanel:
         self._result_count = 1
         #: The pending re-price, so a burst of keystrokes costs one call.
         self._cost_task: Any = None
+        #: Which estimate is the one wanted. Moved on when a run is refused for
+        #: the role, so an estimate asked before that refusal, and answering
+        #: after it, cannot take the role wall down. See `_still_pricing`.
+        self._estimate_generation = 0
+        #: The estimate on its way, and the key of what it asked. One at a
+        #: time: see `_request_cost`.
+        self._cost_request: Any = None
+        self._cost_request_key: tuple | None = None
+        #: The form moved on while an estimate was out, so the newest form is
+        #: priced when that one lands rather than by cancelling it.
+        self._cost_wanted_again = False
+        #: The newest estimate drawn, so the same question asked again soon is
+        #: answered from here rather than from the server.
+        self._cost_quote: _CostQuote | None = None
+        #: What the cost line says. Held because the line is rebuilt on every
+        #: visit to the Create tab, and an estimate that is not asked for again
+        #: has to have something to show.
+        self._cost_message = ""
         #: Rebuilds waiting for the next frame. omni.ui refuses a container
         #: clear during event dispatch, and every renderer here is reachable
         #: from a click. See redraw.py.
@@ -1011,8 +1098,12 @@ class RunDiffusionPanel:
         with frame:
             with ui.VStack(height=0, spacing=4):
                 with ui.HStack(height=20, spacing=6):
+                    # Drawn with the estimate already in hand. The refresh
+                    # below asks again only if the form has moved on since.
                     self._cost_label = ui.Label(
-                        "", elided_text=True, style={"font_size": _SIZE_BODY, "color": _TEXT_BODY}
+                        self._cost_message,
+                        elided_text=True,
+                        style={"font_size": _SIZE_BODY, "color": _TEXT_BODY},
                     )
                     with ui.HStack(width=120, spacing=4):
                         ui.Label("Results", width=48, style={"font_size": _SIZE_BODY, "color": _TEXT_BODY})
@@ -1030,6 +1121,7 @@ class RunDiffusionPanel:
                     style=_STYLE_PRIMARY,
                     clicked_fn=self._on_generate_clicked,
                 )
+                self._sync_generate_button()
         self._schedule_cost_refresh()
 
     def _render_account_bar(self) -> None:
@@ -1467,6 +1559,7 @@ class RunDiffusionPanel:
         self._refresh_status()
 
     def _set_cost(self, message: str) -> None:
+        self._cost_message = message
         if self._cost_label is not None:
             self._cost_label.text = message
 
@@ -1497,7 +1590,7 @@ class RunDiffusionPanel:
                     self._tool_frame = ui.Frame(height=0)
                     with self._tool_frame:
                         self._build_tool_row("Loading tools...")
-                    if self._tools:
+                    if self._tools or self._catalog:
                         self._render_tool_picker()
 
                     self._form_frame = ui.Frame(height=0)
@@ -1560,7 +1653,7 @@ class RunDiffusionPanel:
         The guard is repeated here rather than left to the render alone: with
         nothing to draw into there is no reason to book a frame at all.
         """
-        if self._tool_frame is None or not self._tools:
+        if self._tool_frame is None or not (self._tools or self._catalog):
             return
         self._redraws.request("tool-picker", self._render_tool_picker_now)
 
@@ -1580,13 +1673,22 @@ class RunDiffusionPanel:
         clicking one opens its list and nothing can stop it, so a dropdown
         that opens a window instead is not something this toolkit can express.
         """
-        if self._tool_frame is None or not self._tools:
+        if self._tool_frame is None or not (self._tools or self._catalog):
             return
         # Frame is a Container, so the label is replaced by rebuilding.
         self._tool_frame.clear()
         selected = self._selected_tool()
+        no_tools = self._no_tools_wall()
         with self._tool_frame:
-            self._build_tool_row(selected.name if selected else "Choose a tool...")
+            if no_tools is not None:
+                self._build_tool_row("No tools available")
+            else:
+                self._build_tool_row(selected.name if selected else "Choose a tool...")
+        if no_tools is not None and self._form_frame is not None:
+            # Where the inputs would be, with who can change it.
+            self._form_frame.clear()
+            with self._form_frame:
+                ui.Label(f"{no_tools.message} {no_tools.detail}", word_wrap=True)
 
     def _build_tool_row(self, name: str) -> None:
         """TOOL over the tool's name, and Browse... beside it.
@@ -1616,9 +1718,17 @@ class RunDiffusionPanel:
 
     def _on_browse_clicked(self) -> None:
         if not self._tools:
-            self._set_error("Sign in to browse tools.")
+            no_tools = self._no_tools_wall()
+            if not self._session.is_signed_in:
+                self._set_error("Sign in to browse tools.")
+            elif no_tools is not None:
+                self._set_error(no_tools.message)
+            else:
+                self._set_error("The tool catalogue has not loaded yet.")
             return
-        self._tool_browser.show(self._tools, self._on_browsed_tool, kits=self._kits)
+        self._tool_browser.show(
+            self._tools, self._on_browsed_tool, kits=self._kits, hides=self._hides_tool
+        )
 
     def _on_browsed_tool(self, tool: tools_api.ToolSummary) -> None:
         """Point the dropdown at the browsed tool, so one selection drives both.
@@ -1630,7 +1740,13 @@ class RunDiffusionPanel:
 
         It is adopted instead, because the server has already said this account
         can run it, which is the only question the dropdown's contents answer.
+
+        Unless the role blocks it. The kits and the catalogue the browser shows
+        are already filtered, so this is the backstop for a list that was not.
         """
+        if self._hides_tool(tool):
+            self._set_error(self._blocked_tool_message(tool))
+            return
         if tool.id not in [t.id for t in self._tools]:
             self._tools.append(tool)
         self._selected_tool_id = tool.id
@@ -2580,7 +2696,9 @@ class RunDiffusionPanel:
     def _tool_filter_label(self, tool_id: str | None) -> str:
         if not tool_id:
             return "All tools"
-        for tool in self._tools:
+        # The whole catalogue first: a tool the role blocks is still a tool
+        # the library holds results from, and is named like any other.
+        for tool in [*self._catalog, *self._tools]:
             if tool.id == tool_id:
                 return tool.name or tool.id
         # Filtered on a tool that is not in the catalogue this account can see.
@@ -2588,7 +2706,12 @@ class RunDiffusionPanel:
         return tool_id
 
     def _choose_filter_tool(self) -> None:
-        if not self._tools:
+        """Pick a tool to filter the library by, from the whole catalogue.
+
+        Including tools the role blocks: the library still lists what they
+        made, and filtering by one runs nothing. Only running is hidden.
+        """
+        if not self._catalog:
             self._set_error("The tool catalogue has not loaded yet.")
             return
 
@@ -2596,7 +2719,7 @@ class RunDiffusionPanel:
             self._library_draft.tool_id = tool.id
             self._render_filters()
 
-        self._tool_browser.show(self._tools, _picked, kits=self._kits)
+        self._tool_browser.show(self._catalog, _picked, kits=self._all_kits)
 
     def _clear_filter_tool(self) -> None:
         self._library_draft.tool_id = None
@@ -4290,10 +4413,20 @@ class RunDiffusionPanel:
 
         /me is exempt from that gate for exactly this reason. The server stays
         the authority, so this decides what to SAY, never what to allow.
+
+        The role is read here too, so a role without generating is named the
+        moment its account is chosen rather than after a refused estimate. The
+        tools still load: the library and the catalogue are not what it turned
+        off.
         """
         account = self._session.selected_account
+        self._sync_generate_button()
         if account is None or account.allows_this_plugin:
-            self._clear_wall()
+            role_wall = self._role_wall(account)
+            if role_wall is None:
+                self._clear_wall()
+            else:
+                self._render_wall(role_wall)
             return True
 
         self._render_wall(
@@ -4309,6 +4442,96 @@ class RunDiffusionPanel:
             create_tab_only=False,
         )
         return False
+
+    # -- the role ----------------------------------------------------------
+
+    def _role_wall(self, account):
+        """`account`'s role wall, if its role holds Generate back."""
+        return wall_api.role_wall(account, _account_label(account) if account else None)
+
+    def _no_tools_wall(self):
+        """What to say when the catalogue loaded and the role hides all of it,
+        or None when there is a tool to choose or the catalogue is not in."""
+        if self._tools or not self._catalog:
+            return None
+        account = self._session.selected_account
+        return wall_api.no_tools_wall(
+            account_name=_account_label(account) if account else None,
+            team_label=account.team_label if account else None,
+            is_personal=account.is_personal if account else True,
+        )
+
+    def _refused_generating(self, account, stamp) -> bool:
+        """The server refused a run on `account` because its role does not
+        allow generating. Held until the role is read again, and Generate shows
+        it at once. True if held.
+
+        `stamp` is what the request was sent under (see `RdSession.role_stamp`).
+        A refusal from before a sign-out, or from before the roles were last
+        read, is not held. One that is moves the estimate on, so an estimate
+        still in the air cannot answer over it.
+        """
+        if not self._session.note_generate_refused(account, stamp):
+            return False
+        self._estimate_generation += 1
+        self._sync_generate_button()
+        return True
+
+    def _generate_allowed(self) -> bool:
+        """Whether the selected account's role lets the caller start a run.
+
+        No while the role is still loading or being read again after an
+        account change, as well as when it says no.
+        """
+        account = self._session.selected_account
+        return (
+            account is not None
+            and account.can_generate
+            and not self._session.refreshing_accounts
+        )
+
+    def _sync_generate_button(self) -> None:
+        """Make Generate show whether this account may start a run.
+
+        Reached when the button is built and whenever the account behind it
+        changes. The reason is the role wall above it.
+        """
+        button = self._generate_button
+        if button is None:
+            return
+        allowed = self._generate_allowed()
+        button.enabled = allowed
+        button.style = _STYLE_PRIMARY if allowed else _STYLE_PRIMARY_UNAVAILABLE
+
+    def _hides_tool(self, tool) -> bool:
+        """Whether the selected account's role blocks `tool`, which is then not
+        offered anywhere: hidden, rather than shown and refused."""
+        account = self._session.selected_account
+        return account is not None and account.blocks_tool(tool)
+
+    def _blocked_tool_message(self, tool) -> str:
+        account = self._session.selected_account
+        return wall_api.blocked_tool_message(
+            tool_name=tool.name or tool.id,
+            account_name=_account_label(account) if account else None,
+            team_label=account.team_label if account else None,
+            is_personal=account.is_personal if account else True,
+        )
+
+    def _drop_hidden_tools(self, tools: list) -> list:
+        """`tools` without the ones the role blocks.
+
+        A selection among them is let go of, so the first tool the person may
+        use is picked in its place, the same as for a tool the account lost.
+
+        Always a new list, even with nothing hidden: tools a kit offers are
+        appended to the result, and must not end up in the catalogue it came
+        from.
+        """
+        hidden = {tool.id for tool in tools if self._hides_tool(tool)}
+        if self._selected_tool_id in hidden:
+            self._selected_tool_id = None
+        return [tool for tool in tools if tool.id not in hidden]
 
     # -- sign-in -----------------------------------------------------------
 
@@ -4403,7 +4626,9 @@ class RunDiffusionPanel:
             await self._session.sign_out()
         finally:
             self._tools = []
+            self._catalog = []
             self._kits = []
+            self._all_kits = []
             self._tool_tags = {}
             self._selected_tool_id = None
             self._tool_detail = None
@@ -4413,13 +4638,10 @@ class RunDiffusionPanel:
             # The next person must not inherit this one's form on their first
             # account change, nor an estimate asked for this one's account.
             self._account_carry = None
-            self._team_answers = {}
-            self._catalog_generation += 1
-            self._tool_load_generation += 1
-            self._tool_detail_pending = False
-            if self._cost_task is not None:
-                self._cost_task.cancel()
-                self._cost_task = None
+            self._let_go_of_account_answers()
+            # Not drawn into anything now, but the next person's footer is
+            # built from it.
+            self._cost_message = ""
             self._forget_browsing()
             self._current_tab = TAB_CREATE
             # The sign-in screen owns the panel's own window, and it has no
@@ -4435,6 +4657,11 @@ class RunDiffusionPanel:
             # read as the user docking it.
             for surface in POPPABLE_SURFACES:
                 self._close_window(surface)
+            # The tool browser is a window of its own too, listing the account
+            # being signed out of, and a choice made in it would land on
+            # whoever signs in next. Closing it also lets go of kits it is
+            # still fetching.
+            self._tool_browser.close()
             # The sign-in screen replaces the whole root, so nothing that would
             # normally turn these off ever runs: no tab switch, no viewfinder
             # render. Left alone, a globally registered USD listener goes on
@@ -4456,29 +4683,25 @@ class RunDiffusionPanel:
         # Through the session rather than by assignment, so choosing an
         # account is also remembering it.
         self._session.choose_account(accounts[index].id)
+        # The roles are read again, so one changed on the web since sign-in is
+        # seen without a restart. Started now, so Generate waits from this
+        # moment; the request itself goes out with the redraw below.
+        refresh = self._session.begin_accounts_refresh()
         # Only a switch a wall offered carries the form, and only to the
         # account it offered. Choosing in the picker starts over, as it did.
         carry = self._account_carry
         if carry is not None and carry.account_id != accounts[index].id:
             carry = None
         self._account_carry = carry
-        # Every catalogue and tool load still in the air was asked for the
-        # previous account.
-        self._catalog_generation += 1
-        self._tool_load_generation += 1
-        self._tool_detail_pending = False
-        # An estimate still in the air was asked for the previous account, and
-        # with teams to ask about it can take several round trips to land.
-        if self._cost_task is not None:
-            self._cost_task.cancel()
-            self._cost_task = None
-        self._team_answers = {}
+        self._let_go_of_account_answers()
         self._clear_wall()
         self._set_cost("")
         # The account decides which tools exist and who pays, so the list is
         # refetched rather than reused.
         self._tools = []
+        self._catalog = []
         self._kits = []
+        self._all_kits = []
         self._tool_tags = {}
         self._selected_tool_id = carry.tool_id if carry is not None else None
         self._tool_detail = None
@@ -4510,19 +4733,157 @@ class RunDiffusionPanel:
         # and these rebuild containers (the Account tab, a torn-out window, the
         # wall), which omni.ui refuses during dispatch whichever container it
         # is. The state above changes now; only the drawing waits.
-        self._account_redraws.request("account-change", self._redraw_for_account)
+        self._account_redraws.request(
+            "account-change", lambda: self._redraw_for_account(refresh)
+        )
 
-    def _redraw_for_account(self) -> None:
-        """Everything an account change redraws, and the refetches after it."""
+    def _let_go_of_account_answers(self) -> None:
+        """Stop waiting on everything asked for the account being left.
+
+        For every way the account billed changes: one chosen in the picker,
+        the team selected turning out to be gone, and signing out.
+
+        Every catalogue, kit, tag and tool load still in the air was asked for
+        that account, and each of them checks one of these two generations
+        when it lands, so none of them is drawn under the account that follows.
+
+        An estimate still in the air was asked for it as well, and with teams
+        to ask about it can take several round trips to land. The one held was
+        answered for it too, so the account that follows is asked.
+        """
+        self._catalog_generation += 1
+        self._tool_load_generation += 1
+        self._tool_detail_pending = False
+        self._drop_cost()
+        self._team_answers = {}
+
+    def _redraw_for_account(self, refresh: int | None = None) -> None:
+        """Everything an account change redraws, and the refetches after it.
+
+        `refresh` is the account-list re-read the change started, or None to
+        start one here.
+        """
         # The Account tab spells out who pays, so it is stale the moment the
         # account changes. Rebuilt rather than patched.
         if self._current_tab == TAB_ACCOUNT:
             self._show_tab(TAB_ACCOUNT)
         for surface in POPPABLE_SURFACES:
             self._rebuild_surface(surface)
+        # An open tool browser shows the account being left: its catalogue,
+        # its kits, the kit it has open, and a choice that would land on the
+        # new account. Closed; Browse opens it fresh on this one.
+        self._tool_browser.close()
+        self._spawn(self._reread_accounts_then_load(refresh))
+
+    def _account_gone(self, account, refresh: int) -> None:
+        """The server refused a request because `account`, the team selected,
+        is no longer this person's to use (see `RdSession.account_request`).
+
+        The account list is read again, which is where a team that is gone
+        falls back to personal. `refresh` is that re-read, already started, so
+        Generate waits from this moment.
+        """
+        self._spawn(self._reread_accounts_then_load(refresh, gone=account))
+
+    async def _reread_accounts_then_load(
+        self, refresh: int | None = None, *, gone=None
+    ) -> None:
+        """Read the account list again, then check the account and fetch what
+        it shows.
+
+        A role changed on the web reaches the panel only through /me, which is
+        otherwise read once, at sign-in, so this runs on every account change.
+        It comes BEFORE the tools and kits are fetched, so they are filtered by
+        the role as it is now rather than as it was at sign-in, and a refusal
+        the panel had been holding on to (see `note_generate_refused`) is
+        replaced by what the role says today.
+
+        The account chosen and a form carried across the switch are left as
+        they are while it loads: the selection is kept by id, and the carry is
+        applied by the tool load that follows. Generate waits for the answer
+        (see `_generate_allowed`). If /me cannot be read, the list already held
+        is used: the server still decides every request.
+
+        `gone` is the selected team a request was just refused for as no longer
+        this person's to use, when that is what asked for this re-read rather
+        than an account change (see `_account_gone`).
+        """
+        session = self._session
+        if refresh is None:
+            refresh = session.begin_accounts_refresh()
+        self._sync_generate_button()
+        before = _account_list_shape(session.accounts)
+        selected_before = session.selected_account_id
+        try:
+            payload = await session.fetch_me()
+        except asyncio.CancelledError:
+            session.finish_accounts_refresh(refresh, None)
+            raise
+        except Exception as error:  # noqa: BLE001 - the list already held still works
+            logger.info("RunDiffusion: could not read the account list again. %s", error)
+            payload = None
+        if not session.finish_accounts_refresh(refresh, payload):
+            # Another account change asked again, and its answer is the one
+            # that decides.
+            return
+        if _account_list_shape(session.accounts) != before:
+            # BILLED TO lists the accounts by position and name, so a team
+            # added, removed or renamed on the web redraws it. The selection is
+            # already kept, or moved to personal if its team is gone.
+            self._render_account_bar()
+            if self._current_tab == TAB_ACCOUNT:
+                self._show_tab(TAB_ACCOUNT)
+        said = None
+        if gone is not None:
+            if session.selected_account_id == selected_before:
+                # The list still has the team, or could not be read. Nothing
+                # changed, so nothing is fetched again: asked of the same team,
+                # it would be refused the same way and read the list again,
+                # for as long as the two disagreed. The next refusal asks.
+                self._check_plugin_access()
+                return
+            # Nobody chose this account change, so it is said, and said again
+            # when the tool has loaded for the account now billed (see
+            # `_load_tool_detail`), which otherwise takes the line down.
+            said = wall_api.account_gone_message(
+                account_name=_account_label(gone), team_label=gone.team_label
+            )
+            self._set_error(said)
+        if session.selected_account_id != selected_before:
+            # The team chosen is gone and the selection fell back to personal.
+            # Library and Uploads were rebuilt for the team before this landed,
+            # so they may hold its pages, its error, or a page still on its way.
+            # Dropped (which also makes a late page miss its generation) and
+            # loaded again for the account now billed, the same as a change in
+            # the picker does. A filter on the team's tools would narrow
+            # personal's library to nothing, so the filters go too.
+            #
+            # The same goes for what was asked for the team and has not landed:
+            # its catalogue, its kits, its tags, the tool on the form, an
+            # estimate. Landing now, each would be drawn under personal, and a
+            # refusal among them would take down the line saying which team
+            # went. What the browser opens on (catalogue, kits, tags) is the
+            # team's too, so it is dropped and the browser closed: a tool
+            # chosen in it would land on personal. All three are fetched again
+            # below.
+            #
+            # The tool selected and what is typed on its form stay, unlike a
+            # change made in the picker: nobody chose this one, and the tool
+            # is loaded again for the account now billed.
+            self._let_go_of_account_answers()
+            self._catalog = []
+            self._kits = []
+            self._all_kits = []
+            self._tool_tags = {}
+            self._tool_browser.close()
+            self._forget_browsing()
+            self._library_filters = assets_api.LibraryFilters()
+            self._library_draft = assets_api.LibraryFilters()
+            for surface in POPPABLE_SURFACES:
+                self._rebuild_surface(surface)
         if not self._check_plugin_access():
             return
-        self._spawn(self._load_tools())
+        self._spawn(self._load_tools(said))
         self._spawn(self._load_kits())
         self._spawn(self._load_tool_tags())
 
@@ -4536,13 +4897,28 @@ class RunDiffusionPanel:
         up rather than surfacing anything, and the browser will try again on
         its own if it opens with nothing.
         """
+        # Kits are the account's, like the catalogue, so they answer to the
+        # catalogue's generation: a list fetched for an account the person has
+        # since left, or signed out of, is dropped when it lands.
+        generation = self._catalog_generation
         try:
-            self._kits = await kits_api.list_kits(self._session)
+            kits = await kits_api.list_kits(self._session)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - the flat list still works
+            if generation != self._catalog_generation:
+                return
             logger.info("RunDiffusion: could not prefetch kits. %s", error)
             self._kits = []
+            self._all_kits = []
+            return
+        if generation != self._catalog_generation:
+            return
+        # The role's blocked tools are taken out here, inside each kit, because
+        # a kit carries copies of catalogue rows. The full set is kept for the
+        # library's tool filter.
+        self._all_kits = kits
+        self._kits = kits_api.visible_kits(kits, self._hides_tool)
 
     def _on_tools_page(self, tools: list[tools_api.ToolSummary]) -> None:
         """A page of the catalogue landed. Show what is there so far.
@@ -4551,11 +4927,17 @@ class RunDiffusionPanel:
         all of them: someone who signs in and immediately opens it would
         otherwise be searching the first hundred tools forever, because the
         window took a copy of the list at the moment it opened.
+
+        Tools the role blocks are hidden from what can be run. The browser is
+        handed the whole catalogue and applies the rule it was opened with,
+        which differs between choosing a tool and filtering the library.
         """
+        self._catalog = tools
+        tools = self._drop_hidden_tools(tools)
         self._tools = tools
         if self._selected_tool_id is None and tools:
             self._selected_tool_id = tools[0].id
-        self._tool_browser.update_tools(tools)
+        self._tool_browser.update_tools(self._catalog)
 
     def _forget_uploads(self) -> None:
         """Drop the held pages of uploads, because they no longer list them all.
@@ -4595,13 +4977,23 @@ class RunDiffusionPanel:
         empty vocabulary draws the rows as unavailable, which is the same thing
         this would have done with a message in the log.
         """
-        self._tool_tags = tool_tags_api.group_by_type(
-            await tool_tags_api.list_tool_tags(self._session)
-        )
+        # The tags are the account's, like the catalogue and the kits, so
+        # they answer to the same generation: a vocabulary fetched for an
+        # account the person has since left is dropped when it lands.
+        generation = self._catalog_generation
+        tags = await tool_tags_api.list_tool_tags(self._session)
+        if generation != self._catalog_generation:
+            return
+        self._tool_tags = tool_tags_api.group_by_type(tags)
         if self._current_tab == TAB_LIBRARY:
             self._render_filters()
 
-    async def _load_tools(self) -> None:
+    async def _load_tools(self, said: str | None = None) -> None:
+        """Fetch the selected account's catalogue, then the tool on the form.
+
+        `said` is something the status line is holding that the person has to
+        be told, handed on so the tool's load does not take it down.
+        """
         generation = self._catalog_generation
 
         def on_page(tools) -> None:
@@ -4622,11 +5014,19 @@ class RunDiffusionPanel:
             return
         if generation != self._catalog_generation:
             return
-        self._tools = tools
+        self._catalog = list(tools)
+        self._tools = self._drop_hidden_tools(tools)
 
         carry = self._account_carry
         if carry is not None and not self._carry_is_for_selected(carry):
             carry = self._account_carry = None
+        if carry is not None and carry.tool is not None and self._hides_tool(carry.tool):
+            # This account's role blocks the carried tool, so it is not adopted
+            # and the form does not follow it. The first tool the role allows
+            # is picked instead.
+            carry = self._account_carry = None
+            if self._selected_tool_id not in {t.id for t in self._tools}:
+                self._selected_tool_id = self._tools[0].id if self._tools else None
         if (
             carry is not None
             and carry.tool is not None
@@ -4637,12 +5037,16 @@ class RunDiffusionPanel:
             # listing never shows, the same case `_on_browsed_tool` adopts.
             self._tools.append(carry.tool)
         if not self._tools:
+            # A catalogue the role hides all of is said so, rather than left
+            # on "Loading tools..." for good. See `_render_tool_picker_now`.
+            if self._catalog and self._current_tab == TAB_CREATE:
+                self._render_tool_picker()
             return
         if self._current_tab == TAB_CREATE:
             self._render_tool_picker()
-            self._spawn(self._load_tool_detail())
+            self._spawn(self._load_tool_detail(said))
 
-    async def _load_tool_detail(self) -> None:
+    async def _load_tool_detail(self, said: str | None = None) -> None:
         summary = self._selected_tool()
         if summary is None or self._form_frame is None:
             return
@@ -4662,15 +5066,20 @@ class RunDiffusionPanel:
         if account_carry is not None:
             carry_over = dict(account_carry.values)
 
-        if self._tool_detail is not None and self._tool_detail.id != summary.id:
+        if (
+            self._tool_detail is not None
+            and self._tool_detail.id != summary.id
+            and self._role_wall(self._session.selected_account) is None
+        ):
             # The wall answered for the tool being replaced. Left up, its
             # Switch would carry a tool nobody priced on the account it names.
+            # A role wall stays: it is about the account, not the tool.
             self._clear_wall()
         # So is an estimate still in the air: it priced the tool on screen
         # until now, and landing after this it would draw that tool's wall.
-        if self._cost_task is not None:
-            self._cost_task.cancel()
-            self._cost_task = None
+        # The one held goes too, because the wall it drew may just have been
+        # taken down above.
+        self._drop_cost()
         self._tool_load_generation += 1
         generation = self._tool_load_generation
         self._tool_detail_pending = True
@@ -4697,6 +5106,20 @@ class RunDiffusionPanel:
             # would land on whatever the panel has moved on to.
             return
         self._tool_detail_pending = False
+        if self._hides_tool(tool):
+            # Its listing did not show that the role blocks it, and its own
+            # record does. It is dropped like a tool the listing hid, and the
+            # reason is said where its inputs would have been.
+            self._tools = [t for t in self._tools if t.id != tool.id]
+            self._selected_tool_id = None
+            self._set_cost("")
+            self._form_frame.clear()
+            with self._form_frame:
+                ui.Label(
+                    f"{self._blocked_tool_message(tool)} Choose another tool.",
+                    word_wrap=True,
+                )
+            return
         self._tool_detail = tool
         # An image chosen for the previous tool belongs to that tool's field, so
         # it goes with it rather than following the user to the next one.
@@ -4737,6 +5160,10 @@ class RunDiffusionPanel:
                 "Images you chose from your personal library or uploads were "
                 f"not carried over to {where}."
             )
+        elif said:
+            # The account changed without the person choosing it, and this is
+            # the load that followed. Put back rather than cleared.
+            self._set_error(said)
         else:
             self._set_status("")
 
@@ -4748,6 +5175,12 @@ class RunDiffusionPanel:
         The cost sits above Generate and has to be true when it is read, which
         means it cannot wait for a button. It also cannot fire per keystroke, so
         every change restarts one short timer.
+
+        Only the timer restarts. An estimate already on its way is left to
+        land: cancelling it would stop the panel waiting for the answer, not the
+        server working it out, because the request runs to the end on its
+        worker thread either way. What happens when the timer runs out is
+        `_request_cost`'s to decide.
         """
         if self._cost_task is not None:
             self._cost_task.cancel()
@@ -4758,20 +5191,148 @@ class RunDiffusionPanel:
             await asyncio.sleep(COST_DEBOUNCE_SECONDS)
         except asyncio.CancelledError:
             return
-        await self._preview_cost()
+        self._request_cost()
 
-    async def _preview_cost(self) -> None:
+    def _request_cost(self) -> None:
+        """Price the form on screen, unless that answer is here or on its way.
+
+        Decided in this order:
+
+        - An estimate is already out, so nothing is sent. One at a time,
+          always: two in the air make the server work out both, and a server
+          that is slow to answer would otherwise collect a queue of them. If
+          the form has moved on since that one set off, the newest form is
+          priced when it lands.
+        - The estimate on screen answers exactly this question (the same body
+          for the same account) and is recent (COST_QUOTE_SECONDS), so it is
+          drawn again as it stands and nothing is sent. Every visit to the
+          Create tab rebuilds the cost line and the form, and every rebuild
+          reports a change, but none of them is a new question.
+        - Otherwise the question is new, and it is asked.
+
+        Reached from the timer and from an estimate landing, never from a click:
+        drawing a held estimate can rebuild the wall, which omni.ui refuses
+        during dispatch (see redraw.py).
+        """
+        question = self._cost_question()
+        if question is None:
+            self._set_cost("")
+            return
+        role_wall = self._role_wall(question.account)
+        if role_wall is not None:
+            # The role holds Generate back, so there is nothing to price. Said
+            # here as well as in `_preview_cost`, ahead of the held estimate
+            # below: one drawn before the role changed would otherwise be
+            # drawn again over the role's wall and take it down.
+            self._set_cost("")
+            self._render_wall(role_wall)
+            return
+        if self._cost_request is not None:
+            # The newest form decides. One put back to what is already being
+            # asked about wants nothing more once that answer lands.
+            self._cost_wanted_again = question.key != self._cost_request_key
+            return
+        quote = self._cost_quote
+        if (
+            quote is not None
+            and quote.key == question.key
+            and time.monotonic() - quote.landed_at < COST_QUOTE_SECONDS
+        ):
+            self._show_quote(quote)
+            return
+        self._cost_wanted_again = False
+        self._cost_request_key = question.key
+        self._cost_request = self._spawn(self._send_cost(question))
+
+    async def _send_cost(self, question: _CostQuestion) -> None:
+        """One estimate, then the form as it is now if it moved meanwhile."""
+        try:
+            await self._preview_cost(question)
+        finally:
+            # Only this estimate's own record. Dropping one (another account,
+            # another tool, signing out) clears the record at once, and the
+            # next estimate can start before this one hears it was cancelled.
+            if self._cost_request is asyncio.current_task():
+                self._cost_request = None
+                self._cost_request_key = None
+        if self._cost_wanted_again:
+            self._cost_wanted_again = False
+            self._request_cost()
+
+    def _drop_cost(self) -> None:
+        """Forget every estimate: the one waiting, the one in the air, the one held.
+
+        For a change that makes all of them about something no longer on
+        screen: another account, another tool, signing out. The one in the air
+        is cancelled rather than left to land because it may still have teams
+        to ask about, one request each, for a question nobody is asking any
+        more. Each of those changes is one deliberate act, so this happens no
+        faster than a person can do it.
+        """
+        if self._cost_task is not None:
+            self._cost_task.cancel()
+            self._cost_task = None
+        if self._cost_request is not None:
+            self._cost_request.cancel()
+            self._cost_request = None
+            self._cost_request_key = None
+        self._cost_wanted_again = False
+        self._cost_quote = None
+
+    def _cost_question(self) -> _CostQuestion | None:
+        """The form on screen as an estimate asks about it. None if nothing prices."""
         tool = self._tool_detail
         if tool is None or not self._session.is_signed_in:
+            return None
+        account = self._session.selected_account
+        values = self._form.collect()
+        count = self._requested_results()
+        selections = self._form.image_selections()
+        body = generate_api.preview_cost_body(tool, values, count, image_selections=selections)
+        # The account the way accounts are told apart here (see
+        # `_same_account`), and the body exactly as it is sent, written with
+        # its keys in a fixed order so two readings of one form compare equal.
+        key = (
+            None if account is None or account.is_personal else account.id,
+            json.dumps(body, sort_keys=True, default=str),
+        )
+        return _CostQuestion(tool, account, values, count, selections, key)
+
+    def _show_quote(self, quote: _CostQuote) -> None:
+        """Draw a held estimate again, the way it was drawn when it landed."""
+        self._set_cost(quote.message)
+        if quote.wall is None:
+            self._clear_wall()
+        else:
+            self._render_wall(quote.wall)
+
+    async def _preview_cost(self, question: _CostQuestion | None = None) -> None:
+        """Ask for the estimate of `question` (the form on screen if None), and draw it.
+
+        This always asks. Whether to ask at all is `_request_cost`'s decision,
+        and every re-price goes through that.
+        """
+        if question is None:
+            question = self._cost_question()
+        if question is None:
             self._set_cost("")
             return
 
         # Read once, so the estimate, the wall and any team asked about it all
         # answer the same question.
-        account = self._session.selected_account
-        values = self._form.collect()
-        count = self._requested_results()
-        selections = self._form.image_selections()
+        tool, account = question.tool, question.account
+        values, count, selections = question.values, question.count, question.selections
+        role_wall = self._role_wall(account)
+        if role_wall is not None:
+            # The server checks the role before it prices anything, so asking
+            # would only fetch the refusal this already knows about.
+            self._set_cost("")
+            self._render_wall(role_wall)
+            return
+        # Which estimate this is, and what the role was read as when it was
+        # asked: a refused run in the meantime makes it stale.
+        estimate = self._estimate_generation
+        stamp = self._session.role_stamp()
 
         # The wall stays up while the run is re-priced and is replaced, or taken
         # down, when the answer lands. Clearing it first made it blink on every
@@ -4782,12 +5343,27 @@ class RunDiffusionPanel:
                 self._session, tool, values, count, image_selections=selections
             )
         except ApiError as error:
-            if not self._still_pricing(account, tool):
+            if not self._still_pricing(account, tool, estimate):
+                return
+            if wall_api.is_generate_refusal(error.code, error.details):
+                # The role changed after the account list was read. Said in the
+                # wall, naming the team, rather than in a cost line too narrow
+                # to read it, and held as the role until the list is read
+                # again, so Generate and the next estimate stop asking.
+                self._refused_generating(account, stamp)
+                self._set_cost("")
+                self._render_wall(
+                    self._role_wall(self._session.selected_account)
+                    or wall_api.role_blocked_wall(
+                        account_name=_account_label(account) if account else None,
+                        is_personal=account.is_personal if account else True,
+                    )
+                )
                 return
             self._clear_wall()
             self._set_cost(f"Cost unavailable. {error.message}")
             return
-        if not self._still_pricing(account, tool):
+        if not self._still_pricing(account, tool, estimate):
             # Answered for an account the person has since left, or a tool
             # they have since replaced. Its price and its wall belong to that.
             return
@@ -4804,7 +5380,8 @@ class RunDiffusionPanel:
         # No balance. v2 publishes the price of the run and never the account's
         # remaining tokens, so "N left after this run" would be a number this
         # panel invented.
-        self._set_cost(" · ".join(parts) if parts else "")
+        message = " · ".join(parts) if parts else ""
+        self._set_cost(message)
 
         can_run = bool(result.get("can_run"))
         is_personal = account.is_personal if account else True
@@ -4823,7 +5400,7 @@ class RunDiffusionPanel:
             # Asked before anything is drawn, so a team-plan member never sees
             # an upgrade prompt flash up and get replaced.
             team = await self._find_team_that_can_run(tool, values, count, selections)
-            if not self._still_pricing(account, tool):
+            if not self._still_pricing(account, tool, estimate):
                 return
             if team is not None:
                 wall = wall_api.switch_wall(team_id=team.id, account_name=_account_label(team))
@@ -4831,11 +5408,23 @@ class RunDiffusionPanel:
             self._clear_wall()
         else:
             self._render_wall(wall)
+        # Held, so the same question asked again soon is answered from here.
+        # Only an answer that was drawn: a failure, or one dropped above for an
+        # account or tool since left, leaves the next look free to ask.
+        self._cost_quote = _CostQuote(question.key, time.monotonic(), message, wall)
 
-    def _still_pricing(self, account, tool) -> bool:
-        """Whether an estimate asked for `account` and `tool` is still wanted."""
+    def _still_pricing(self, account, tool, estimate: int) -> bool:
+        """Whether estimate number `estimate`, asked for `account` and `tool`,
+        is still wanted.
+
+        The number matters when nothing else moved: a run refused for the role
+        while the estimate was in the air leaves the account and tool as they
+        were, and an estimate that predates the refusal must not take its wall
+        down (that left Generate unavailable with no reason shown).
+        """
         return (
-            _same_account(account, self._session.selected_account)
+            estimate == self._estimate_generation
+            and _same_account(account, self._session.selected_account)
             and self._tool_detail is tool
         )
 
@@ -4861,7 +5450,7 @@ class RunDiffusionPanel:
         less than the run will cost, and its own estimate after the switch is
         the same kind of answer the personal account got.
         """
-        teams = wall_api.teams_worth_checking(self._session.accounts)
+        teams = wall_api.teams_worth_checking(self._session.accounts, tool)
         if not teams:
             return None
         carried = {
@@ -4958,7 +5547,9 @@ class RunDiffusionPanel:
         # change is still loading.
         summary = next((t for t in self._tools if t.id == tool.id), None)
         if summary is None:
-            summary = tools_api.ToolSummary(id=tool.id, name=tool.name)
+            summary = tools_api.ToolSummary(
+                id=tool.id, name=tool.name, tool_tag_ids=tool.tool_tag_ids
+            )
         return _AccountCarry(
             account_id=account_id,
             tool_id=tool.id,
@@ -4980,9 +5571,24 @@ class RunDiffusionPanel:
             self._set_error("Sign in to generate.")
             return
 
+        # The button is unavailable in both of these cases, so this is the
+        # backstop for a click that raced the account list or the role.
+        account = self._session.selected_account
+        if account is None or not account.role_is_known or self._session.refreshing_accounts:
+            self._set_error("Your account is still loading. Try again in a moment.")
+            return
+        if not account.can_generate:
+            self._set_error(self._role_wall(account).message)
+            return
+
         tool = self._tool_detail
         if tool is None:
-            self._set_error("No tool selected.")
+            no_tools = self._no_tools_wall()
+            self._set_error(no_tools.message if no_tools is not None else "No tool selected.")
+            return
+
+        if account.blocks_tool(tool):
+            self._set_error(self._blocked_tool_message(tool))
             return
 
         unsupported = tool.unsupported_required_field
@@ -5005,12 +5611,15 @@ class RunDiffusionPanel:
         image_state = self._form.export_image_state()
         count = self._requested_results()
 
-        # Who pays is read on the click too. A refusal is about the account the
-        # run was sent under, which is not always the one selected when the
-        # answer comes back.
-        account = self._session.selected_account
+        # Who pays is read on the click too, above. A refusal is about the
+        # account the run was sent under, which is not always the one selected
+        # when the answer comes back.
 
         self._clear_wall()
+        # Spending moves the balance the held estimate was about, and its wall
+        # has just been taken down, so the next look at the form asks again
+        # rather than drawing that estimate back.
+        self._cost_quote = None
         self._jobs.submit(
             tool.name,
             lambda job: self._run_job(
@@ -5037,6 +5646,9 @@ class RunDiffusionPanel:
             raise RuntimeError(f"still needs {names}")
 
         self._jobs.update(job, "submitting")
+        # What the request is sent under, so a refusal answering it can be told
+        # apart from one answering an earlier sign-in or an older role.
+        stamp = self._session.role_stamp()
         try:
             request_id = await generate_api.submit(
                 self._session, tool, values, count, image_selections=selections, account=account
@@ -5055,15 +5667,28 @@ class RunDiffusionPanel:
             # balance moves, and preview-cost is advisory rather than a
             # reservation. Same two-axis routing either way.
             is_personal = account.is_personal if account else True
+            # A sign-out while the run was in the air means this answers for
+            # someone who is no longer here: the job still fails with its
+            # reason, but nothing is held, asked or drawn for whoever is signed
+            # in now, who may hold the same team with a different role.
+            current = self._session.same_session(stamp)
+            if current and wall_api.is_generate_refusal(error.code, error.details):
+                # Held for the account the run was sent on, whichever one is
+                # selected now.
+                self._refused_generating(account, stamp)
             wall = wall_api.wall_for_error(
                 error.code,
                 error.status,
                 is_personal=is_personal,
                 email_verified=self._session.email_verified,
                 account_name=_account_label(account) if account else None,
+                details=error.details,
+                message=error.message,
             )
             if wall is None:
                 raise
+            if not current:
+                raise RuntimeError(wall.message) from None
             if wall_api.personal_cannot_pay(
                 is_personal=is_personal,
                 email_verified=self._session.email_verified,
@@ -5085,6 +5710,9 @@ class RunDiffusionPanel:
                 on_screen is not None and on_screen.id == tool.id
             ):
                 self._render_wall(wall)
+                # The server has just said otherwise about this form, so an
+                # estimate held from before is no longer worth drawing back.
+                self._cost_quote = None
             raise RuntimeError(wall.message) from None
 
         job.request_id = request_id

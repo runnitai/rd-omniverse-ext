@@ -12,6 +12,7 @@ echoed what the caller sent, so reading it as the next page loops forever.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -19,10 +20,13 @@ from rundiffusion_omniverse.api import tools as tools_api
 
 
 class FakeSession:
-    """Only the two things `list_tools` asks a session for."""
+    """Only the three things `list_tools` asks a session for."""
 
     def account_params(self) -> dict:
         return {}
+
+    def account_request(self):
+        return contextlib.nullcontext()
 
     async def auth_headers(self) -> dict:
         return {"X-Device-Id": "device-1"}

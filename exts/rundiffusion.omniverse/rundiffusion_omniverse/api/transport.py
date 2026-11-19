@@ -61,6 +61,16 @@ class ApiError(RuntimeError):
     def is_device_code_expired(self) -> bool:
         return self.status == 410 or self.code == "DEVICE_CODE_EXPIRED"
 
+    @property
+    def is_account_gone(self) -> bool:
+        """The team the request named is no longer the caller's to use.
+
+        Two codes, one meaning to the person: they were removed from the team,
+        or the team was deleted. The server checks this on every request that
+        names a team, so it can arrive in answer to any of them.
+        """
+        return self.code in ("ACCOUNT_NOT_MEMBER", "ACCOUNT_NOT_FOUND")
+
 
 def _parse_error(status: int, body: bytes) -> ApiError:
     try:

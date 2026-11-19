@@ -272,14 +272,15 @@ def mime_for(filename: str) -> str | None:
 async def list_uploads(
     session: RdSession, limit: int = 24, *, cursor: str | None = None
 ) -> AssetPage:
-    payload = await request_json_async(
-        "GET",
-        with_query(
-            f"{api_base_url()}/uploads",
-            {"limit": limit, "cursor": cursor, **session.account_params()},
-        ),
-        headers=await session.auth_headers(),
-    )
+    with session.account_request():
+        payload = await request_json_async(
+            "GET",
+            with_query(
+                f"{api_base_url()}/uploads",
+                {"limit": limit, "cursor": cursor, **session.account_params()},
+            ),
+            headers=await session.auth_headers(),
+        )
     items = [
         Asset(
             id=item["id"],
@@ -320,19 +321,20 @@ async def list_library(
     free-text prompt query, so offering a search box would promise something the
     API does not do.
     """
-    payload = await request_json_async(
-        "GET",
-        with_query(
-            f"{api_base_url()}/library",
-            {
-                "limit": limit,
-                "cursor": cursor,
-                **(filters or LibraryFilters()).as_params(),
-                **session.account_params(),
-            },
-        ),
-        headers=await session.auth_headers(),
-    )
+    with session.account_request():
+        payload = await request_json_async(
+            "GET",
+            with_query(
+                f"{api_base_url()}/library",
+                {
+                    "limit": limit,
+                    "cursor": cursor,
+                    **(filters or LibraryFilters()).as_params(),
+                    **session.account_params(),
+                },
+            ),
+            headers=await session.auth_headers(),
+        )
     items = []
     for item in (payload or {}).get("data") or []:
         # v2 withholds TEXT results from this surface, but a defensive check
@@ -371,12 +373,13 @@ async def upload_image(
     uploading it makes a durable copy that can also be fed back into another
     generation as an UPLOAD_REF.
     """
-    payload = await post_multipart_async(
-        with_query(f"{api_base_url()}/uploads", session.account_params()),
-        fields={},
-        files=[("file", filename, content, mime_type)],
-        headers=await session.auth_headers(),
-    )
+    with session.account_request():
+        payload = await post_multipart_async(
+            with_query(f"{api_base_url()}/uploads", session.account_params()),
+            fields={},
+            files=[("file", filename, content, mime_type)],
+            headers=await session.auth_headers(),
+        )
     item: dict[str, Any] = payload or {}
     return Asset(
         id=item["id"],

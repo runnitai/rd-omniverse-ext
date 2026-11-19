@@ -23,12 +23,12 @@ there is no cursor to follow and none is invented here.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable
 
 from .constants import api_base_url
 from .session import RdSession
-from .tools import ToolSummary
+from .tools import ToolSummary, tool_tag_ids
 from .transport import request_json_async, with_query
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,7 @@ def _kit_tool(entry: Any) -> KitTool | None:
             name=tool.get("name") or tool["id"],
             avatar_url=tool.get("avatar_url"),
             description=tool.get("description"),
+            tool_tag_ids=tool_tag_ids(tool.get("tool_tags")),
         ),
         kit_tags=_strings(entry.get("kit_tags")),
         labels=_labels(entry.get("labels")),
@@ -155,11 +156,42 @@ def parse_kits(payload: Any) -> list[Kit]:
     return kits
 
 
+def visible_kits(kits: list[Kit], is_hidden: Callable[[ToolSummary], bool]) -> list[Kit]:
+    """`kits` without the tools `is_hidden` says this person may not see.
+
+    The server resolves a kit against what the ACCOUNT can run, but a team
+    role's blocked tools are resolved here, which is why the flat catalogue is
+    filtered by the panel. A kit carries copies of catalogue rows, so the same
+    rule has to reach inside it: without this, a tool hidden from the flat list
+    would still be one kit card away.
+
+    A kit left with nothing in it is dropped, the same as the server drops a
+    kit whose every tool is invisible, and a default tool the role hides is
+    forgotten rather than left pointing at a tool the kit no longer lists. A
+    tab left with nothing under it goes too, for the reason the server derives
+    the tab row from the tools it returned: no tab should open onto nothing.
+    The tabs that survive keep the curator's order.
+    """
+    out = []
+    for kit in kits:
+        tools = tuple(entry for entry in kit.tools if not is_hidden(entry.tool))
+        if not tools:
+            continue
+        default = kit.default_tool_id
+        if default is not None and not any(entry.tool.id == default for entry in tools):
+            default = None
+        used = {tag for entry in tools for tag in entry.kit_tags}
+        tabs = tuple(tag for tag in kit.kit_tags if tag in used)
+        out.append(replace(kit, tools=tools, default_tool_id=default, kit_tags=tabs))
+    return out
+
+
 async def list_kits(session: RdSession) -> list[Kit]:
     """Every kit this account can see on this surface, in display order."""
-    payload = await request_json_async(
-        "GET",
-        with_query(f"{api_base_url()}/kits", session.account_params()),
-        headers=await session.auth_headers(),
-    )
+    with session.account_request():
+        payload = await request_json_async(
+            "GET",
+            with_query(f"{api_base_url()}/kits", session.account_params()),
+            headers=await session.auth_headers(),
+        )
     return parse_kits(payload)

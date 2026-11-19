@@ -16,6 +16,7 @@ from __future__ import annotations
 import omni.ui as ui
 import pytest
 
+from rundiffusion_omniverse.api.session import RdSession
 from rundiffusion_omniverse.api.tools import ToolDetail, ToolField
 from rundiffusion_omniverse.form import INLINE_FIELD_LIMIT, plan_layout, prompt_text
 from rundiffusion_omniverse.panel import TAB_CREATE, TAB_LIBRARY, RunDiffusionPanel
@@ -242,10 +243,13 @@ class TestTheFooterAction:
         panel._action_bar = FakeContainer()
         panel._current_tab = tab
         panel._cost_label = object()
+        panel._cost_message = ""
         panel._num_results = object()
         panel._generate_button = object()
         panel._result_count = 1
         panel._schedule_cost_refresh = lambda: None
+        # Generate reads the selected account's role as it is built.
+        panel._session = RdSession()
         return panel
 
     def test_another_tab_leaves_the_row_empty(self):
@@ -281,3 +285,21 @@ class TestTheFooterAction:
         panel._render_action_bar_now()
 
         assert panel._action_bar.cleared == 1
+
+    def test_the_cost_line_comes_back_saying_what_it_said(self, monkeypatch):
+        """Rebuilt on every visit to the Create tab. An unchanged form is not
+        priced again, so a line drawn blank would stay blank: it is drawn with
+        the estimate it was showing."""
+        texts = []
+
+        def label(text="", **_kwargs):
+            texts.append(text)
+            return FakeWidget()
+
+        monkeypatch.setattr(ui, "Label", label, raising=False)
+        panel = self._panel(TAB_CREATE)
+        panel._cost_message = "4 tokens · about 9s each"
+
+        panel._render_action_bar_now()
+
+        assert texts[0] == "4 tokens · about 9s each"

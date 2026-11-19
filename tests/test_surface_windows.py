@@ -582,6 +582,7 @@ class TestSigningOut:
         panel._account_carry = None
         panel._team_answers = {}
         panel._cost_task = None
+        panel._cost_request = None
         panel._catalog_generation = 0
         panel._tool_load_generation = 0
         panel._tool_detail_pending = False
@@ -594,7 +595,20 @@ class TestSigningOut:
         panel._camera_watch = type(
             "W", (), {"stop": lambda _s: panel.stopped.append("cameras")}
         )()
+        panel.browser_closed = []
+        panel._tool_browser = type(
+            "B", (), {"close": lambda _s: panel.browser_closed.append(True)}
+        )()
         return panel
+
+    def test_the_tool_browser_is_closed_too(self):
+        """It lists the account being signed out of, and a choice made in it
+        would land on whoever signs in next."""
+        panel = self._signed_out_panel({s: False for s in POPPABLE_SURFACES})
+
+        _run(panel._sign_out())
+
+        assert panel.browser_closed == [True]
 
     @BOTH
     def test_the_window_is_closed(self, surface):

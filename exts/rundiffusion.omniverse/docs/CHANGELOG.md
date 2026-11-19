@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.4.1] - 2026-11-18
+
+### Changed
+
+- **A role that cannot generate is explained.** A shared account whose role
+  does not allow generating shows a message naming the account, and who
+  manages it, as soon as it is chosen, and Generate is unavailable for it.
+  Tools a role blocks are left out of the catalogue, the kits, the tool
+  browser and the Library filter.
+- **Plugin access follows the same rules as the service.** Your personal
+  account is always allowed, and a shared account needs plugin access that
+  includes Omniverse. The verify-your-email message appears only for an
+  unverified email, and a spending limit is put into words wherever it stops
+  a run.
+- The account list is read again on every account switch, so a role changed
+  on the web is seen without a restart.
+
+### Fixed
+
+- **An account you no longer belong to falls back to your personal account**,
+  and the panel says which account went. Every request used to go on failing
+  against it until a restart or a switch by hand. Tools, kits and filters that
+  were still loading for that account are no longer shown under your personal
+  account, the message naming the account stays up, and an open tool browser
+  closes.
+- **The cost is asked for once.** One estimate is out at a time, the same form
+  on the same account is answered from the estimate already on screen for a
+  short while, and the newest form is priced when an estimate lands. Coming
+  back to the Create tab no longer asks again.
+- An answer that was already on its way at sign-out (a refreshed sign-in, a
+  refused run, a list of kits or an estimate) can no longer change what the
+  next person to sign in sees.
+- Requests that find the sign-in expired at the same moment share one
+  refresh.
+
 ## [0.4.0] - 2026-11-04
 
 ### Added

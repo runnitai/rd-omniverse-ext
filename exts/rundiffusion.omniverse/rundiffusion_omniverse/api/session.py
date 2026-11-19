@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from typing import Callable
 
 from . import token_store
 from .constants import PLUGIN_KIND, PLUGIN_KIND_WILDCARD, api_base_url
@@ -81,10 +83,58 @@ class Account:
     #: concept, to "Studio" say). Copy that names a team without naming it uses
     #: this rather than the word, which would read wrong to that company.
     team_label: str | None = None
+    #: The role's restriction settings, published beside the permission map.
+    #: Only `restrict_tools_settings` is read here, for `blocks_tool`.
+    permission_settings: dict = field(default_factory=dict)
 
     @property
     def is_personal(self) -> bool:
         return (self.kind or "").upper() == "PERSONAL"
+
+    @property
+    def role_is_known(self) -> bool:
+        """Whether this account's permission map has arrived.
+
+        The API publishes a full map for every account, personal ones
+        included, so an empty one means it has not been read yet rather than
+        that the role grants nothing.
+        """
+        return bool(self.permissions)
+
+    @property
+    def can_generate(self) -> bool:
+        """Whether this account's role lets the caller start a run.
+
+        An explicit yes is required, so a role that is still loading is a no:
+        Generate waits for the role rather than finding out from a refusal. The
+        server enforces this regardless; reading it here is what lets the panel
+        say who can change it before anything is sent.
+        """
+        return self.permissions.get("GENERATE") is True
+
+    def blocks_tool(self, tool) -> bool:
+        """Whether this account's role hides `tool` from the person holding it.
+
+        A role blocks tools two ways: by listing their ids, and by listing tags,
+        which blocks every tool carrying one of them. Nothing else is consulted.
+
+        Only while BLOCK_TOOLS is on and its settings are present. The server
+        already sends the settings only for an active restriction; checking
+        again means a stale payload can never hide a tool the role allows.
+        """
+        if tool is None or self.permissions.get("BLOCK_TOOLS") is not True:
+            return False
+        settings = self.permission_settings.get("restrict_tools_settings")
+        if not isinstance(settings, dict):
+            return False
+        tool_id = getattr(tool, "id", None)
+        blocked_ids = settings.get("tool_ids")
+        if tool_id and isinstance(blocked_ids, list) and tool_id in blocked_ids:
+            return True
+        blocked_tags = settings.get("tool_tags")
+        if not isinstance(blocked_tags, dict):
+            return False
+        return any(blocked_tags.get(tag) is True for tag in getattr(tool, "tool_tag_ids", ()))
 
     @property
     def allows_this_plugin(self) -> bool:
@@ -96,15 +146,36 @@ class Account:
         denied even when plugins are otherwise on. The server enforces this
         either way; reading it here is what lets the panel explain itself
         instead of failing opaquely.
+
+        Read the way the server reads it. A personal account has no role to
+        consult, so the server never gates it. A team account needs an explicit
+        USE_PLUGINS and a list naming this kind (or the wildcard): the server
+        denies one that publishes neither, so the panel does too, rather than
+        offering a team the first request would refuse.
         """
-        if not self.permissions.get("USE_PLUGINS", True):
+        if self.is_personal:
+            return True
+        if self.permissions.get("USE_PLUGINS") is not True:
             return False
         kinds = self.plugin_kinds
-        if not kinds:
-            # No list published. The server is still the authority, so this
-            # stays permissive and lets the call be the one that refuses.
-            return True
         return PLUGIN_KIND_WILDCARD in kinds or PLUGIN_KIND in kinds
+
+
+@dataclass(frozen=True)
+class RoleStamp:
+    """Which sign-in, and which reading of the roles, a request was sent under."""
+
+    session: int
+    reading: int
+
+
+def _settings(raw) -> dict:
+    """An account's restriction settings, or an empty map for anything else.
+
+    A personal account publishes null here, and `blocks_tool` reads the map
+    with `.get`, so whatever is not a map is read as no settings at all.
+    """
+    return raw if isinstance(raw, dict) else {}
 
 
 @dataclass
@@ -121,6 +192,28 @@ class RdSession:
     #: is also what the API means by omitting `team_id` entirely. Persisted, so
     #: the choice outlives the Kit session that made it.
     selected_account_id: str | None = None
+    #: Whether the account list is being read again. A role read before that
+    #: answer lands may be out of date, so Generate waits for it.
+    refreshing_accounts: bool = False
+    #: Which re-read is the newest, so an older answer landing late is dropped.
+    _accounts_generation: int = field(default=0, repr=False)
+    #: Which sign-in this is. Moved on by every sign-out, so an answer to a
+    #: request made before it (a token refresh, a refused run) is not applied
+    #: to the next person, or to nobody.
+    session_epoch: int = 0
+    #: How many times the account list, and the roles in it, has been read.
+    #: A refusal asked before the latest reading is older than what it says.
+    _accounts_read: int = field(default=0, repr=False)
+    #: Told when the server says the selected team is no longer the caller's
+    #: to use, with that team and the number of the re-read of the account
+    #: list this starts. Whoever draws the accounts sets it, and has to finish
+    #: that re-read: Generate waits until it does.
+    on_account_gone: Callable[[Account, int], None] | None = field(default=None, repr=False)
+    #: Held while the id token is being refreshed, so the calls that find it
+    #: expired at the same moment share one refresh. See `ensure_valid_token`.
+    _refresh_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False, compare=False
+    )
 
     @property
     def is_signed_in(self) -> bool:
@@ -165,6 +258,54 @@ class RdSession:
         if account is not None and not account.is_personal and account.id:
             return {"team_id": account.id}
         return {}
+
+    @contextmanager
+    def account_request(self, account: Account | None = None):
+        """Around one request made on `account`, or on the selected account.
+
+        The server checks the account on every request, so any of them can be
+        the first to find that a team is gone: the person was removed from it,
+        or it was deleted, while the panel was open. The account list is
+        otherwise read only at sign-in and on an account change, so until one
+        of those the panel would go on asking a team that refuses everything.
+        Every request that names an account goes out inside this, and one
+        refused that way asks for the list to be read again (see
+        `on_account_gone`), which is what moves the selection to personal.
+
+        The refusal still reaches the caller, which reports it as it does any
+        other failure. /me names no account, so it is never made inside this
+        and cannot ask for itself.
+        """
+        account = account if account is not None else self.selected_account
+        epoch = self.session_epoch
+        try:
+            yield
+        except ApiError as error:
+            if error.is_account_gone:
+                self._note_account_gone(account, epoch)
+            raise
+
+    def _note_account_gone(self, account: Account | None, epoch: int) -> None:
+        """A request sent on `account` during sign-in number `epoch` was
+        refused because that team is no longer the caller's to use.
+
+        Acted on only while it is still about what the panel shows:
+
+        - not after a sign-out, when it answers for someone who is no longer
+          here and the next person may hold the same team;
+        - not for an account that is no longer selected, such as the status of
+          a run started before a switch, or a price asked of another team;
+        - not while the list is already being read again, so refusals that
+          land together read it once. A read that fails leaves the selection
+          where it was, and the next refusal asks again.
+        """
+        if epoch != self.session_epoch:
+            return
+        if account is None or account.is_personal or account.id != self.selected_account_id:
+            return
+        if self.refreshing_accounts or self.on_account_gone is None:
+            return
+        self.on_account_gone(account, self.begin_accounts_refresh())
 
     # -- sign-in -----------------------------------------------------------
 
@@ -242,6 +383,7 @@ class RdSession:
         Both endpoints publish the same two shapes, which is why one method
         serves both and why a restored session can be filled in from /me alone.
         """
+        self._accounts_read += 1
         self.user = payload.get("user") or {}
         self.accounts = [
             Account(
@@ -251,9 +393,72 @@ class RdSession:
                 permissions=account.get("permissions") or {},
                 plugin_kinds=account.get("plugin_kinds") or [],
                 team_label=account.get("team_label"),
+                permission_settings=_settings(account.get("permission_settings")),
             )
             for account in payload.get("accounts") or []
         ]
+
+    def begin_accounts_refresh(self) -> int:
+        """Start reading the account list again. Returns the re-read's number.
+
+        The roles in it come from /me, which is otherwise read only at sign-in,
+        so a role an administrator changed on the web would be invisible until
+        a restart. Until the answer lands the held role is not trusted.
+        """
+        self._accounts_generation += 1
+        self.refreshing_accounts = True
+        return self._accounts_generation
+
+    def finish_accounts_refresh(self, generation: int, payload: dict | None) -> bool:
+        """Take the answer to re-read number `generation`. False if overtaken.
+
+        `payload` is the /me response, or None when it could not be read, in
+        which case the list already held stays: the server is still the
+        authority, and a failed refresh is no reason to stop the person working.
+        The selected account is kept by id, and falls back to personal only if
+        it is no longer in the list.
+        """
+        if generation != self._accounts_generation:
+            return False
+        self.refreshing_accounts = False
+        if payload is not None:
+            selected = self.selected_account_id
+            self.adopt_identity(payload)
+            self.adopt_stored_account(selected)
+        return True
+
+    def role_stamp(self) -> RoleStamp:
+        """When a request that can answer about the role is sent. Taken before
+        it goes out and handed back with its answer to `note_generate_refused`."""
+        return RoleStamp(session=self.session_epoch, reading=self._accounts_read)
+
+    def same_session(self, stamp: RoleStamp) -> bool:
+        """Whether `stamp` was taken during this sign-in."""
+        return stamp.session == self.session_epoch
+
+    def note_generate_refused(self, account: Account | None, stamp: RoleStamp) -> bool:
+        """The server refused a run on `account` because its role does not
+        allow generating, though the account list said it did. True if held.
+
+        The server's answer is newer than the list, so it is held as the role
+        until the list is read again: otherwise Generate goes on offering a run
+        that is refused every time. Replaced rather than edited in place, so
+        nothing holding the old object has it change underneath it.
+
+        Not held when `stamp`, taken as the request was sent, is out of date:
+        a sign-out since means it answers for someone else (the next person may
+        hold the same team with a role that allows it), and a reading of the
+        roles since is newer than the request was.
+        """
+        if stamp != self.role_stamp():
+            return False
+        for index, held in enumerate(self.accounts):
+            same = held.is_personal if account is None else held.id == account.id
+            if same:
+                self.accounts[index] = replace(
+                    held, permissions={**held.permissions, "GENERATE": False}
+                )
+        return True
 
     def choose_account(self, account_id: str | None) -> None:
         """Bill runs to `account_id` from now on, and remember it.
@@ -338,11 +543,17 @@ class RdSession:
         if not self.refresh_token:
             raise ApiError(status=401, message="Not signed in.")
 
+        epoch = self.session_epoch
         payload = await request_json_async(
             "POST",
             f"{api_base_url()}/auth/token/refresh",
             body={"refresh_token": self.refresh_token},
         )
+        if epoch != self.session_epoch:
+            # Signed out while the exchange was in the air. Taking its answer
+            # would put the credentials back, and save them to disk, for a
+            # session the person just ended.
+            raise ApiError(status=401, message="Not signed in.")
         self.id_token = payload["id_token"]
         # The service may rotate the refresh token, and echoes it either way, so
         # storing what comes back means never having to detect which happened.
@@ -351,11 +562,29 @@ class RdSession:
         self._persist()
 
     async def ensure_valid_token(self) -> str:
+        """The id token, refreshed first if it is about to expire.
+
+        One refresh at a time. Every request the panel has going when the token
+        runs out (an estimate, a page of the library, the poll of a run) arrives
+        here together, and without the lock each of them would exchange the
+        same refresh token for a new one of its own. The first refreshes; the
+        rest wait for it, look again, and find the token fresh. If that refresh
+        failed, the next one in line tries once more for itself.
+        """
         if not self.refresh_token:
             raise ApiError(status=401, message="Not signed in.")
-        if not self.id_token or time.time() >= (self.expires_at - TOKEN_REFRESH_SKEW_SECONDS):
-            await self.refresh()
+        if self._token_needs_refresh():
+            async with self._refresh_lock:
+                # Looked at again now that it is this call's turn: whoever held
+                # the lock may already have done the refresh.
+                if self._token_needs_refresh():
+                    await self.refresh()
         return self.id_token or ""
+
+    def _token_needs_refresh(self) -> bool:
+        return not self.id_token or time.time() >= (
+            self.expires_at - TOKEN_REFRESH_SKEW_SECONDS
+        )
 
     async def auth_headers(self) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {await self.ensure_valid_token()}"}
@@ -401,4 +630,10 @@ class RdSession:
             # The remembered account goes with the session that meant it. The
             # next person to sign in on this machine must not inherit a team.
             self.selected_account_id = None
+            # A re-read still in the air answers for the person signing out.
+            self.refreshing_accounts = False
+            self._accounts_generation += 1
+            # So does everything else still in the air: a token refresh, a
+            # refused run. See `session_epoch`.
+            self.session_epoch += 1
             token_store.clear()
